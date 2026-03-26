@@ -16,8 +16,8 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [강화된 2단계 자동 정렬 알고리즘] Difference of Gaussians (DoG) 기반 빔스탑 탐지
-def auto_calibrate_center(img_data):
+# [강화된 2단계 자동 정렬 알고리즘] Difference of Gaussians (DoG) 기반 동적 빔스탑 탐지
+def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
     try:
         import scipy.ndimage as ndi
         
@@ -26,16 +26,28 @@ def auto_calibrate_center(img_data):
         clipped = np.clip(img_data, 0, p99)
         
         # 2. DoG 필터 (Mexican Hat) 적용
-        # 빔스탑(어두운 원)과 할로(밝은 회절 링)의 극적인 대비를 이용
-        # sigma=50은 주변 밝기를 넓게 평균내고, sigma=10은 빔스탑의 날카로운 윤곽을 잡음
         blur_large = ndi.gaussian_filter(clipped, sigma=50)
         blur_small = ndi.gaussian_filter(clipped, sigma=10)
-        
         dog = blur_large - blur_small
         
-        # 3. 가장 완벽한 둥근 얼룩(Blob)의 중심 좌표 찾기
-        # 빔스탑에 가려져 중심이 어두우면 dog가 크게 양수(+)
-        # 만약 마스킹 없이 빔이 직접 때려 포화된 경우 dog가 크게 음수(-)
+        # 3. 탐색 영역 제한(Tracking)이 주어진 경우, ±window 픽셀 내에서만 탐색
+        if base_x is not None and base_y is not None:
+            h, w = dog.shape
+            x_min = max(0, int(base_x - window))
+            x_max = min(w, int(base_x + window + 1))
+            y_min = max(0, int(base_y - window))
+            y_max = min(h, int(base_y + window + 1))
+            
+            sub_dog = dog[y_min:y_max, x_min:x_max]
+            
+            if abs(np.min(sub_dog)) > abs(np.max(sub_dog)):
+                dy, dx = np.unravel_index(np.argmin(sub_dog), sub_dog.shape)
+            else:
+                dy, dx = np.unravel_index(np.argmax(sub_dog), sub_dog.shape)
+                
+            return float(x_min + dx), float(y_min + dy)
+            
+        # 전체 영역 탐색 (초기 1회)
         if abs(np.min(dog)) > abs(np.max(dog)):
             dby_auto, dbx_auto = np.unravel_index(np.argmin(dog), dog.shape)
         else:
@@ -43,9 +55,13 @@ def auto_calibrate_center(img_data):
             
         return float(dbx_auto), float(dby_auto)
     except ImportError:
-        # scipy가 없을 경우를 대비한 단순 Fallback
         dby_auto, dbx_auto = np.unravel_index(np.argmin(img_data), img_data.shape)
         return float(dbx_auto), float(dby_auto)
+    except Exception:
+        # 기타 로직 실패 시 안전하게 기존 기준점 반환
+        if base_x is not None and base_y is not None: return base_x, base_y
+        h, w = img_data.shape
+        return w/2.0, h/2.0
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
 st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
@@ -161,16 +177,25 @@ if uploaded_files:
     st.info("💡 위 이미지의 **빨간 십자선(+)**이 파란색 빔스탑의 정중앙에 위치하는지 확인하시고 아래 버튼을 누르세요.")
 
     if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
-        # pyFAI 엔진 설정 (파일은 이미 로딩 과정에서 temp_dir에 저장 완료됨)
-        geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
-                                  wavelength=wavelength, pixel1=px_m, pixel2=px_m)
-        
         results, zip_buffer = [], io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             pbar = st.progress(0)
+            
+            # [동적 빔 센터 흐름 추적]
+            # 첫 샘플은 사용자가 설정한 dbx, dby를 기준으로, 다음 샘플부터는 이전 샘플의 중심을 기준으로 ±20 픽셀씩만 한정 추적
+            track_x, track_y = dbx, dby
+            
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
+                    
+                    # 현재 샘플의 물리적 원점(Beam Center) 미세조정 탐색 및 업데이트
+                    track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=20)
+                    
+                    # 각 이미지만의 고유하게 틀어진 빔 센터를 바탕으로 pyFAI 물리적 엔진 초기화
+                    geo = AzimuthalIntegrator(dist=dist_m, poni1=track_y*px_m, poni2=track_x*px_m, 
+                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m)
+                                              
                     q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
                     q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
                     
@@ -236,10 +261,10 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            # 2D GIWAXS 패턴
+                            # 2D GIWAXS 패턴 (동적으로 추적된 track_x, track_y 기준)
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
-                            ext = [-dbx*dq, (w-dbx)*dq, -dby*dq, (h-dby)*dq]
+                            ext = [-track_x*dq, (w-track_x)*dq, -track_y*dq, (h-track_y)*dq]
                             fig2d, ax2d = plt.subplots()
                             ax2d.imshow(np.log1p(np.clip(np.flipud(img_data), 0, None)), cmap='jet', extent=ext)
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
