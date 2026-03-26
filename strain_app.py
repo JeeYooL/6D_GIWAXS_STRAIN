@@ -16,8 +16,26 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-st.set_page_config(page_title="UNIST 6D GIWAXS Dual Analyzer", layout="wide")
-st.title("🔬 6D GIWAXS 수직/수평 Strain 동시 분석")
+# [추가] 지평선 및 빔스탑 기반 2단계 자동 정렬 알고리즘
+def auto_calibrate_center(img_data):
+    # Step 1: DBy 찾기 (수직 그라디언트 최대 지점 = Horizon)
+    # axis=1로 합산하여 각 행의 전체 강도 변화를 관찰
+    v_profile = np.sum(img_data, axis=1)
+    v_gradient = np.abs(np.diff(v_profile))
+    dby_auto = np.argmax(v_gradient) # 지평선(Horizon) 행 번호
+    
+    # Step 2: DBx 찾기 (검출된 지평선상에서 가장 어두운 지점 = Beamstop)
+    h_profile = img_data[dby_auto, :]
+    dbx_auto = np.argmin(h_profile) # 빔스탑 중심 열 번호
+    
+    return float(dbx_auto), float(dby_auto)
+
+st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
+st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
+
+# --- 세션 상태 초기화 (자동 정렬 값 유지) ---
+if 'dbx' not in st.session_state: st.session_state.dbx = 1440.36
+if 'dby' not in st.session_state: st.session_state.dby = 1053.49
 
 # --- 사이드바: 실험 셋업 ---
 st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
@@ -26,9 +44,22 @@ dist_mm = st.sidebar.number_input("SDD (mm)", value=100.0, format="%.3f")
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
 st.sidebar.divider()
-st.sidebar.subheader("🎯 빔 센터(Beam Center) 설정")
-dbx = st.sidebar.number_input("DBx (Center X - 1)", value=1440.36)
-dby = st.sidebar.number_input("DBy (Center Y - 1)", value=1053.49)
+st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
+
+# [기능 추가] 자동 정렬 버튼
+if st.sidebar.button("🪄 빔 센터 자동 찾기 (지평선 기반)"):
+    # 현재 업로드된 파일이 있는지 확인
+    if 'current_img' in st.session_state:
+        dbx_a, dby_a = auto_calibrate_center(st.session_state.current_img)
+        st.session_state.dbx = dbx_a
+        st.session_state.dby = dby_a
+        st.sidebar.success(f"자동 정렬 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
+    else:
+        st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
+
+# 수동 조정 입력창 (세션 상태와 연동)
+dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
+dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
 
 wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
@@ -40,45 +71,38 @@ q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format=
 q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.40)
 q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.80)
 
-# [추가] 수직/수평 각도 범위 설정
-st.sidebar.subheader("🎯 적분 각도(Azimuth) 설정")
-v_width = st.sidebar.slider("수직(Vertical) 적분 폭 (±°)", 1, 30, 10, help="수직 아래(-90°) 기준 폭")
-h_width = st.sidebar.slider("수평(Horizontal) 적분 폭 (±°)", 1, 30, 10, help="수평 좌우(-180°, 0°) 기준 폭")
+st.sidebar.subheader("🎯 1D 적분 각도 설정")
+azi_min = st.sidebar.number_input("최소 Azimuth (°)", value=-180)
+azi_max = st.sidebar.number_input("최대 Azimuth (°)", value=0)
 
 # --- 파일 업로드 ---
-st.sidebar.subheader("📂 데이터 업로드")
-use_sample_data = st.sidebar.checkbox("✅ 샘플 데이터 테스트", value=False)
-
-uploaded_files = []
-if use_sample_data:
-    sample_dir = "sample_data"
-    if os.path.exists(sample_dir):
-        for fname in os.listdir(sample_dir):
-            if fname.lower().endswith(('.tif', '.tiff')):
-                fpath = os.path.join(sample_dir, fname)
-                with open(fpath, "rb") as f:
-                    file_obj = io.BytesIO(f.read()); file_obj.name = fname
-                    uploaded_files.append(file_obj)
-else:
-    uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
 
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
+    
+    # 자동 정렬을 위해 첫 번째 이미지 미리 로드
+    if 'current_img' not in st.session_state or st.session_state.first_file != file_list[0]:
+        st.session_state.current_img = fabio.open(uploaded_files[0]).data
+        st.session_state.first_file = file_list[0]
+
     if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
     if 'zip_data' not in st.session_state: st.session_state.zip_data = None
 
     angles = [extract_incidence_angle(f) for f in file_list]
     input_df = pd.DataFrame({"파일명": file_list, "입사각(deg)": angles})
-    edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor_dual")
+    edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor_auto")
 
-    if st.button("🚀 수직/수평 동시 분석 시작", type="primary"):
+    if st.button("🚀 전수 분석 시작", type="primary"):
         temp_dir = "temp_giwaxs"
         os.makedirs(temp_dir, exist_ok=True)
         paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
         for uf in uploaded_files:
             with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
 
-        geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, wavelength=wavelength, pixel1=px_m, pixel2=px_m)
+        # pyFAI 엔진 설정
+        geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
+                                  wavelength=wavelength, pixel1=px_m, pixel2=px_m)
         
         results, zip_buffer = [], io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
@@ -86,82 +110,56 @@ if uploaded_files:
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
+                    q, I = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_min, azi_max))
                     
-                    # --- [추가] 수직 및 수평 적분 수행 ---
-                    # 수직(Out-of-plane): -90도 중심 
-                    q_v, I_v = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(-90-v_width, -90+v_width))
-                    # 수평(In-plane): 0도 및 -180도 부근 (데이터가 있는 우측 하단 0도 기준 예시) 
-                    q_h, I_h = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(-h_width, 0))
+                    # Origin 저장
+                    txt = pd.DataFrame({"q": q, "I": I}).to_csv(sep='\t', index=False)
+                    zip_file.writestr(f"{row['파일명']}_1D.txt", txt)
 
-                    # 공통 피팅 함수
-                    def fit_peak(q, I):
-                        mask = (q >= q_min) & (q <= q_max)
-                        qc, Ic = q[mask], I[mask]
-                        if len(qc) < 5: return None, None
-                        model = GaussianModel() + LinearModel()
-                        params = model.make_params(amplitude=Ic.max()-Ic.min(), center=(q_min+q_max)/2, sigma=0.05, slope=0, intercept=Ic.min())
-                        params['center'].set(min=q_min, max=q_max)
-                        out = model.fit(Ic, params, x=qc)
-                        return out.params['center'].value, out
-
-                    qv_exp, out_v = fit_peak(q_v, I_v)
-                    qh_exp, out_h = fit_peak(q_h, I_h)
-
-                    strain_v = (q_bulk - qv_exp) / qv_exp * 100 if qv_exp else np.nan
-                    strain_h = (q_bulk - qh_exp) / qh_exp * 100 if qh_exp else np.nan
-
-                    results.append({
-                        "파일명": row["파일명"], "입사각": row["입사각(deg)"],
-                        "V_Peak": qv_exp, "V_Strain(%)": strain_v,
-                        "H_Peak": qh_exp, "H_Strain(%)": strain_h
-                    })
-
-                    # 상세 결과 시각화
-                    with st.expander(f"📊 {row['파일명']} 상세 (V/H 비교)"):
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
-                        with col1:
-                            # 2D 이미지 (Flip 및 q-축 적용)
-                            h_px, w_px = img_data.shape
+                    # 피팅
+                    mask = (q >= q_min) & (q <= q_max)
+                    qc, Ic = q[mask], I[mask]
+                    if len(qc) < 5: continue
+                        
+                    model = GaussianModel() + LinearModel()
+                    params = model.make_params(amplitude=Ic.max()-Ic.min(), center=(q_min+q_max)/2, sigma=0.05, slope=0, intercept=Ic.min())
+                    params['center'].set(min=q_min, max=q_max)
+                    out = model.fit(Ic, params, x=qc)
+                    q_exp = out.params['center'].value
+                    strain = (q_bulk - q_exp) / q_exp * 100
+                    
+                    results.append({"파일명": row["파일명"], "입사각": row["입사각(deg)"], "q_measured": q_exp, "Strain(%)": strain})
+                    
+                    with st.expander(f"📊 {row['파일명']} 상세 분석"):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            # [논문 표기법 적용] q_xy, q_z 축 변환 및 시각화
+                            h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
-                            ext = [-dbx*dq, (w_px-dbx)*dq, -dby*dq, (h_px-dby)*dq]
+                            ext = [-dbx*dq, (w-dbx)*dq, -dby*dq, (h-dby)*dq]
                             fig2d, ax2d = plt.subplots()
-                            im = ax2d.imshow(np.log1p(np.clip(np.flipud(img_data), 0, None)), cmap='jet', extent=ext)
-                            ax2d.set_title("2D GIWAXS (Flipped)"); ax2d.set_xlabel(r"$q_{xy}$"); ax2d.set_ylabel(r"$q_z$")
+                            ax2d.imshow(np.log1p(np.clip(np.flipud(img_data), 0, None)), cmap='jet', extent=ext)
+                            ax2d.set_title("2D GIWAXS (Automated Alignment)"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             st.pyplot(fig2d); plt.close(fig2d)
-                        with col2:
-                            # 수직 피팅 그래프
-                            fig_v, ax_v = plt.subplots(); ax_v.plot(q_v, I_v, 'bo', markersize=2, label='Data (V)')
-                            if out_v: ax_v.plot(q_v[(q_v>=q_min)&(q_v<=q_max)], out_v.best_fit, 'r-')
-                            ax_v.set_title(f"Vertical\nStrain: {strain_v:.3f}%"); ax_v.set_xlim(q_min-0.1, q_max+0.1)
-                            st.pyplot(fig_v); plt.close(fig_v)
-                        with col3:
-                            # 수평 피팅 그래프
-                            fig_h, ax_h = plt.subplots(); ax_h.plot(q_h, I_h, 'go', markersize=2, label='Data (H)')
-                            if out_h: ax_h.plot(q_h[(q_h>=q_min)&(q_h<=q_max)], out_h.best_fit, 'r-')
-                            ax_h.set_title(f"Horizontal\nStrain: {strain_h:.3f}%"); ax_h.set_xlim(q_min-0.1, q_max+0.1)
-                            st.pyplot(fig_h); plt.close(fig_h)
-
+                        with c2:
+                            fig1d, ax1d = plt.subplots()
+                            ax1d.plot(qc, Ic, 'bo', markersize=3, label='Data')
+                            ax1d.plot(qc, out.best_fit, 'r-', label='Fit')
+                            ax1d.set_title(f"Strain: {strain:.3f}%"); ax1d.legend(); st.pyplot(fig1d); plt.close(fig1d)
+                            
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
         
         st.session_state.analysis_results = pd.DataFrame(results)
         st.session_state.zip_data = zip_buffer.getvalue()
 
-    # --- 최종 결과 트렌드 ---
     if st.session_state.analysis_results is not None:
+        st.divider(); st.subheader("📈 입사각별 Strain 트렌드")
         res_df = st.session_state.analysis_results
-        st.divider()
-        st.subheader("📈 입사각별 수직/수평 Strain 비교")
-        
         c1, c2 = st.columns([1, 1.5])
         with c1:
-            st.dataframe(res_df.style.format({"V_Strain(%)": "{:.3f}", "H_Strain(%)": "{:.3f}"}))
-            st.download_button("💾 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "dual_strain_results.csv", key="dual_csv")
-            
+            st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
+            st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv_auto")
         with c2:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.plot(res_df["입사각"], res_df["V_Strain(%)"], 'ro-', label='Vertical (Out-of-plane)')
-            ax.plot(res_df["입사각"], res_df["H_Strain(%)"], 'bs-', label='Horizontal (In-plane)')
-            ax.set_xlabel("Incidence Angle (deg)"); ax.set_ylabel("Strain (%)")
-            ax.legend(); ax.grid(True, alpha=0.5)
-            st.pyplot(fig)
+            fig_tr, ax_tr = plt.subplots()
+            ax_tr.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-'); ax_tr.set_xlabel("Incidence Angle (deg)"); ax_tr.set_ylabel("Strain (%)"); st.pyplot(fig_tr)
