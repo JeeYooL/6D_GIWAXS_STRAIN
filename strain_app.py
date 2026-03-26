@@ -21,7 +21,7 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
     try:
         import scipy.ndimage as ndi
         
-        # 1. 핫픽셀 및 우측 하단 에러 픽셀(빨간 네모) 등 극단적인 노이즈 자르기
+        # 1. 핫픽셀 및 노이즈 자르기
         p99 = np.percentile(img_data, 99.5)
         clipped = np.clip(img_data, 0, p99)
         
@@ -29,10 +29,10 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
         blur_large = ndi.gaussian_filter(clipped, sigma=50)
         blur_small = ndi.gaussian_filter(clipped, sigma=10)
         dog = blur_large - blur_small
+        h, w = dog.shape
         
         # 3. 탐색 영역 제한(Tracking)이 주어진 경우, ±window 픽셀 내에서만 탐색
         if base_x is not None and base_y is not None:
-            h, w = dog.shape
             x_min = max(0, int(base_x - window))
             x_max = min(w, int(base_x + window + 1))
             y_min = max(0, int(base_y - window))
@@ -47,21 +47,25 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
                 
             return float(x_min + dx), float(y_min + dy)
             
-        # 전체 영역 탐색 (초기 1회)
-        if abs(np.min(dog)) > abs(np.max(dog)):
-            dby_auto, dbx_auto = np.unravel_index(np.argmin(dog), dog.shape)
+        # 전체 영역 탐색 (초기 1회): 가장자리 마스킹 아티팩트(예: 우측 하단 붉은 네모)를 회피하기 위해 엣지를 무시
+        margin_x = int(w * 0.20) # 좌우 20% 마진 제외
+        margin_y = int(h * 0.15) # 상하 15% 마진 제외
+        
+        sub_dog = dog[margin_y:h-margin_y, margin_x:w-margin_x]
+        
+        if abs(np.min(sub_dog)) > abs(np.max(sub_dog)):
+            dy, dx = np.unravel_index(np.argmin(sub_dog), sub_dog.shape)
         else:
-            dby_auto, dbx_auto = np.unravel_index(np.argmax(dog), dog.shape)
+            dy, dx = np.unravel_index(np.argmax(sub_dog), sub_dog.shape)
             
-        return float(dbx_auto), float(dby_auto)
+        return float(margin_x + dx), float(margin_y + dy)
     except ImportError:
         dby_auto, dbx_auto = np.unravel_index(np.argmin(img_data), img_data.shape)
         return float(dbx_auto), float(dby_auto)
     except Exception:
         # 기타 로직 실패 시 안전하게 기존 기준점 반환
         if base_x is not None and base_y is not None: return base_x, base_y
-        h, w = img_data.shape
-        return w/2.0, h/2.0
+        return img_data.shape[1]/2.0, img_data.shape[0]/2.0
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
 st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
