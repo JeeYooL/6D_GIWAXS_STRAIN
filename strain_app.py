@@ -323,7 +323,11 @@ if uploaded_files:
                         
                         diagnostics = {
                             'center': best_center, 'fwhm': fwhm_fit,
-                            'r_squared': r_squared, 'n_peaks': len(peaks)
+                            'r_squared': r_squared, 'n_peaks': len(peaks),
+                            'all_peaks': [{
+                                'q': out.params[f'p{j}_center'].value,
+                                'fwhm_q': out.params[f'p{j}_sigma'].value * 2.355
+                            } for j in range(len(peaks))]
                         }
                         
                         return qc, Ic, out, strain, diagnostics
@@ -340,7 +344,8 @@ if uploaded_files:
                     qc_in, Ic_in, fit_in, strain_in, diag_in = result_in
                         
                     results.append({"파일명": row["파일명"], "입사각": row["입사각(deg)"], 
-                                    "Strain_Out(%)": strain_out, "Strain_In(%)": strain_in})
+                                    "Strain_Out(%)": strain_out, "Strain_In(%)": strain_in,
+                                    "diag_out": diag_out, "diag_in": diag_in})
                     
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
@@ -391,7 +396,12 @@ if uploaded_files:
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
         
-        st.session_state.analysis_results = pd.DataFrame(results)
+        # DataFrame에는 표시용 컬럼만, diagnostics는 별도 저장
+        display_results = [{"파일명": r["파일명"], "입사각": r["입사각"], 
+                            "Strain_Out(%)": r["Strain_Out(%)"], "Strain_In(%)": r["Strain_In(%)"]} 
+                           for r in results]
+        st.session_state.analysis_results = pd.DataFrame(display_results)
+        st.session_state.wh_results = results  # diagnostics 포함 원본
         st.session_state.zip_data = zip_buffer.getvalue()
         st.session_state.report_figures = report_figures
 
@@ -485,3 +495,65 @@ if uploaded_files:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key="dl_docx"
                 )
+            
+            # --- Williamson-Hall Plot 분석 ---
+            st.divider()
+            st.subheader("📐 Williamson-Hall Plot (Macrostrain vs Microstrain 비교)")
+            st.caption("β·cos(θ) vs 4·sin(θ) — 기울기 = microstrain(ε), y절편 = Kλ/D (결정립 크기)")
+            
+            lambda_A = (12.3984 / energy_kev)  # Å
+            wh_data = st.session_state.get('wh_results', [])
+            
+            for _, r_row in res_df.iterrows():
+                # results에서 diagnostics 꺼내기
+                match_res = [x for x in wh_data if x['파일명'] == r_row['파일명']]
+                if not match_res or 'diag_out' not in match_res[0]:
+                    continue
+                diag_o = match_res[0]['diag_out']
+                diag_i = match_res[0]['diag_in']
+                
+                with st.expander(f"📐 W-H: {r_row['파일명']} (입사각 {r_row['입사각']:.2f}°)"):
+                    for direction, diag, macro_s in [('Out-of-plane', diag_o, r_row['Strain_Out(%)']),
+                                                      ('In-plane', diag_i, r_row['Strain_In(%)'])]:
+                        all_p = diag.get('all_peaks', [])
+                        if len(all_p) < 2:
+                            st.info(f"{direction}: 피크 {len(all_p)}개 — W-H 분석에는 최소 2개 필요")
+                            continue
+                        
+                        # q → 2θ 변환 및 W-H 데이터 계산
+                        sin_vals, beta_cos_vals = [], []
+                        for pk in all_p:
+                            q_val = pk['q']
+                            fwhm_q = pk['fwhm_q']
+                            theta = np.arcsin(q_val * lambda_A / (4 * np.pi))  # Bragg angle
+                            # FWHM 변환: β_2θ = FWHM_q · λ / (2π·cos(θ))
+                            beta_2theta = fwhm_q * lambda_A / (2 * np.pi * np.cos(theta))
+                            sin_vals.append(4 * np.sin(theta))
+                            beta_cos_vals.append(beta_2theta * np.cos(theta))
+                        
+                        x_wh = np.array(sin_vals)
+                        y_wh = np.array(beta_cos_vals)
+                        
+                        # 선형 회귀: y = slope * x + intercept
+                        if len(x_wh) >= 2:
+                            coeffs = np.polyfit(x_wh, y_wh, 1)
+                            micro_strain = coeffs[0]  # 기울기 = microstrain
+                            y_intercept = coeffs[1]   # Kλ/D
+                            K = 0.9
+                            crystallite_size = K * lambda_A / y_intercept if y_intercept > 0 else float('inf')
+                            
+                            fig_wh, ax_wh = plt.subplots(figsize=(5, 3.5))
+                            ax_wh.scatter(x_wh, y_wh, c='blue', s=50, zorder=5)
+                            x_fit = np.linspace(x_wh.min() * 0.9, x_wh.max() * 1.1, 50)
+                            ax_wh.plot(x_fit, np.polyval(coeffs, x_fit), 'r--', label=f'ε={micro_strain:.5f}')
+                            ax_wh.set_xlabel(r'$4\sin\theta$')
+                            ax_wh.set_ylabel(r'$\beta\cos\theta$ (rad)')
+                            ax_wh.set_title(f'{direction} W-H Plot', fontsize=10)
+                            ax_wh.legend(fontsize=8)
+                            ax_wh.grid(True, alpha=0.3)
+                            st.pyplot(fig_wh); plt.close(fig_wh)
+                            
+                            c1, c2 = st.columns(2)
+                            c1.metric("Macrostrain (단일 피크)", f"{macro_s:.3f}%")
+                            c2.metric("Microstrain (W-H)", f"{micro_strain*100:.4f}%")
+                            st.caption(f"결정립 크기 추정: {crystallite_size:.1f} Å ({crystallite_size/10:.1f} nm) | 피크 {len(all_p)}개 사용")
