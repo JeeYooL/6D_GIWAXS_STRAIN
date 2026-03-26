@@ -16,60 +16,76 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [NEW] 2D 가우시안 덩어리(Blob) 탐색 기반 자동 빔 센터 미세조정
+# [NEW] 급격한 강도 변화(Edge Boundary)의 중간점을 원점으로 인식하는 미세조정 로직
 def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     try:
         import numpy as np
-        from scipy.ndimage import gaussian_filter
+        from scipy.ndimage import gaussian_filter1d, gaussian_filter
         
         h, w = img_data.shape
-        
-        # 1. 핫픽셀 및 노이즈 자르기
         p99 = np.percentile(img_data, 99.5)
         clipped = np.clip(img_data, 0, p99)
         
+        # 연구원님의 핵심 아이디어: 강도(Intensity)에 로그를 씌워 변화(6 과 4의 차이 등)를 명확히 함
+        log_img = np.log1p(clipped)
+        
         if base_x is not None and base_y is not None:
-            # --- 동적 추적(Tracking) / 미세조정 모드 ---
-            # 사용자 입력 기준 근방(±window)에서만 탐색 (수평선에 얽매이지 않고 철저하게 독립적인 X, Y 탐색)
-            y_min = max(0, int(base_y - window))
-            y_max = min(h, int(base_y + window + 1))
-            x_min = max(0, int(base_x - window))
-            x_max = min(w, int(base_x + window + 1))
+            # --- 1. 위아래(Y축) 경계값 중심 인식 ---
+            # DBx를 기준으로 위아래 ±window 만큼의 밝기 프로파일 읽기
+            y_start = max(0, int(base_y - window))
+            y_end = min(h, int(base_y + window))
+            x_target = int(base_x)
             
-            local_region = clipped[y_min:y_max, x_min:x_max]
+            # 1픽셀 너비로는 노이즈가 있을 수 있으니 x근방 5픽셀 두께 평균을 읽음 (더욱 강건함)
+            x_min_slice = max(0, x_target - 2)
+            x_max_slice = min(w, x_target + 3)
+            v_profile = np.mean(log_img[y_start:y_end, x_min_slice:x_max_slice], axis=1)
             
-            # 파란색 빔스탑은 주변(노란색 회절링 등)보다 압도적으로 강도가 낮음
-            # 연구원님 아이디어(급격한 차이가 나는 두 값의 사이 지점을 원점으로 인식하자)를 수학적으로 완벽하게 구현하는 방법은
-            # 이미지를 "크게 뭉개서(Blur)" 가장 거대한 빈 공간(Center of Mass)의 중심을 찾는 것임!
-            # 단일 데드 픽셀이나 얇은 선(Arm)에 속지 않도록 강력한 가우시안 블러 크기(sigma=15) 적용
-            smoothed_local = gaussian_filter(local_region, sigma=15)
+            # 1단위 노이즈 방어를 위한 부드러운 스무딩
+            v_smooth = gaussian_filter1d(v_profile, sigma=3)
             
-            # 뭉개진 이미지에서 가장 어두운 픽셀 = 가장 거대한 빔스탑 덩어리의 정중앙
-            dy, dx = np.unravel_index(np.argmin(smoothed_local), smoothed_local.shape)
+            # 연구원님 아이디어 구현: 6과 4 같이 "큰 차이가 나는 지점(급격한 변화량)" 추출
+            v_diff = np.diff(v_smooth)
             
-            dbx_auto = x_min + dx
-            dby_auto = y_min + dy
+            # 밝다->어둡다 (급격한 추락: 음의 최대 변화량) = 빔스탑 상단 경계
+            # 어둡다->밝다 (급격한 상승: 양의 최대 변화량) = 빔스탑 하단 경계
+            edge_top = np.argmin(v_diff)
+            edge_bottom = np.argmax(v_diff)
+            
+            # 두 경계값(큰 차이가 나는 두 지점)의 정확한 사이지점(Midpoint)을 DBy로 인식
+            dby_auto = y_start + (edge_top + edge_bottom) / 2.0
+            
+            # --- 2. 좌우(X축) 경계값 중심 인식 ---
+            # 찾아낸 DBy_auto를 기준으로 좌우 ±window 만큼 읽기
+            x_start = max(0, int(base_x - window))
+            x_end = min(w, int(base_x + window))
+            y_target = int(dby_auto)
+            
+            y_min_slice = max(0, y_target - 2)
+            y_max_slice = min(h, y_target + 3)
+            h_profile = np.mean(log_img[y_min_slice:y_max_slice, x_start:x_end], axis=0)
+            
+            h_smooth = gaussian_filter1d(h_profile, sigma=3)
+            h_diff = np.diff(h_smooth)
+            
+            # 좌측 경계(추락), 우측 경계(상승)
+            edge_left = np.argmin(h_diff)
+            edge_right = np.argmax(h_diff)
+            
+            # 두 좌우 지점의 사이를 DBx로 인식
+            dbx_auto = x_start + (edge_left + edge_right) / 2.0
             
             return float(dbx_auto), float(dby_auto)
             
         else:
-            # --- 전체 1단계 초기 탐색 (Global Search) 모드 ---
-            margin_x = int(w * 0.20)
-            margin_y = int(h * 0.10)
+            # 전체 1단계 탐색의 경우 빔스탑 전체를 뭉개버리는(Blur) 기존 덩어리 탐색 사용
+            margin_x, margin_y = int(w * 0.20), int(h * 0.10)
             safe_region = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
-            
-            # 전체 화면 탐색 시에는 아티팩트 방지를 위해 더 강력하게 뭉갬
-            smoothed_safe = gaussian_filter(safe_region, sigma=30)
-            
+            smoothed_safe = gaussian_filter(safe_region, sigma=25)
             dy, dx = np.unravel_index(np.argmin(smoothed_safe), smoothed_safe.shape)
-            
-            dbx_auto = margin_x + dx
-            dby_auto = margin_y + dy
-            
-            return float(dbx_auto), float(dby_auto)
+            return float(margin_x + dx), float(margin_y + dy)
             
     except Exception:
-        # 안전 장치: 모두 실패 시 이전 중심 반환 또는 대략 중앙 반환
         if base_x is not None and base_y is not None: return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
 
@@ -116,8 +132,8 @@ px_m = pixel_um * 1e-6
 st.sidebar.divider()
 st.sidebar.header("2. 분석 파라미터")
 q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format="%.4f")
-q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.40)
-q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.80)
+q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.30)
+q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.65)
 
 st.sidebar.subheader("🎯 1D 적분 각도 (Out / In-plane)")
 c_out1, c_out2 = st.sidebar.columns(2)
