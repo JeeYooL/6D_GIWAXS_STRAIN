@@ -99,10 +99,17 @@ if uploaded_files:
                     # [자동 정렬] 빔 센터 계산
                     if use_auto_center:
                         threshold = np.percentile(img_data, 99.9)
-                        mask = img_data > threshold
+                        # '>' 대신 '>='를 사용하여 포화(Saturated)된 픽셀 그룹 전체가 누락되는 현상 방지
+                        mask = img_data >= threshold
                         y_idx, x_idx = np.nonzero(mask)
-                        dby = np.average(y_idx, weights=img_data[mask])
-                        dbx = np.average(x_idx, weights=img_data[mask])
+                        
+                        weights = img_data[mask]
+                        if len(weights) == 0 or np.sum(weights) <= 0:
+                            # 예외 처리: 마스크가 비었거나 값이 이상할 경우, 단순 글로벌 최댓값 픽셀로 지정
+                            dby, dbx = np.unravel_index(np.argmax(img_data), img_data.shape)
+                        else:
+                            dby = np.average(y_idx, weights=weights)
+                            dbx = np.average(x_idx, weights=weights)
                     else:
                         dbx, dby = dbx_manual, dby_manual
 
