@@ -26,10 +26,9 @@ def extract_incidence_angle(filename):
 def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     """
     회절 링의 azimuthal intensity variance를 최소화하는 (cx, cy)를 탐색.
-    정확한 중심에서는 링 위의 밝기가 균일(variance↓), 빗나가면 불균일(variance↑).
+    window: 초기값(base_x, base_y) 주위 탐색 범위 (px)
     """
     try:
-        import numpy as np
         from scipy.optimize import minimize
         from scipy.ndimage import gaussian_filter
         
@@ -38,7 +37,7 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
         img_smooth = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=3)
         
         if base_x is None or base_y is None:
-            # 전역 초기 탐색: 가우시안 블러 최소값
+            # 전역 초기 탐색: 가우시안 블러 최소값 (보통 빔스탑 위치)
             margin_x, margin_y = int(w * 0.20), int(h * 0.10)
             safe = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=25)
             safe_region = safe[margin_y:h-margin_y, margin_x:w-margin_x]
@@ -46,16 +45,19 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
             base_x, base_y = float(margin_x + dx), float(margin_y + dy)
         
         # --- 회절 링 기반 원점 최적화 ---
-        # 하반원(빔 아래쪽)에서만 샘플링: 각도 범위 200°~340° (약 -160°~ -20°, 즉 아래쪽 반원)
-        # GIWAXS 상반원은 데이터가 없으므로 제외
-        n_angles = 72  # 5° 간격
+        # 하반원(빔 아래쪽)에서만 샘플링
+        n_angles = 72
         angles = np.linspace(np.radians(200), np.radians(340), n_angles)
-        
-        # 사용할 반지름: 빔스탑을 넘어서 링이 존재하는 영역
-        radii = np.arange(150, 650, 50)  # 150~600px, 50px 간격
+        radii = np.arange(120, 700, 40) # 더 넓고 촘촘한 범위 탐색
         
         def azimuthal_cost(center):
             cx, cy = center
+            # window 밖으로 나가는 것에 대한 페널티 (Soft Constraints)
+            dist_sq = (cx - base_x)**2 + (cy - base_y)**2
+            penalty = 0
+            if dist_sq > window**2:
+                penalty = 1e6 * (np.sqrt(dist_sq) - window)
+                
             total_var = 0.0
             n_valid = 0
             for r in radii:
@@ -65,32 +67,36 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
                     py = int(cy + r * np.sin(theta))
                     if 0 <= px < w and 0 <= py < h:
                         val = img_smooth[py, px]
-                        if val > 0:  # 마스크/빔스탑 영역(0 또는 매우 작은 값) 제외
+                        if val > 0:
                             intensities.append(val)
-                if len(intensities) > n_angles // 3:  # 최소 1/3 이상의 유효 데이터가 있어야 분산 계산
+                if len(intensities) > n_angles // 3:
                     arr = np.array(intensities)
-                    # 정규화된 분산 (스케일 독립적)
                     mean_val = arr.mean()
                     if mean_val > 0:
                         total_var += arr.std() / mean_val
                         n_valid += 1
-            return total_var / max(n_valid, 1)
+            return (total_var / max(n_valid, 1)) + penalty
         
-        # Nelder-Mead 최적화 (초기값 ±30px 범위 내에서 탐색)
-        x0 = [base_x, base_y]
-        result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
-                          options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
+        # Nelder-Mead 최적화
+        res = minimize(azimuthal_cost, [base_x, base_y], method='Nelder-Mead',
+                       options={'xatol': 0.1, 'fatol': 1e-6, 'maxiter': 300})
         
-        opt_x, opt_y = result.x
+        opt_x, opt_y = res.x
         
-        # 결과가 초기값에서 너무 벗어나면 (>30px) 초기값을 유지 (안전장치)
-        if abs(opt_x - base_x) > 30 or abs(opt_y - base_y) > 30:
-            return float(base_x), float(base_y)
-        
+        # 최종 결과가 window를 벗어났는지 다시 한 번 체크 (Hard limit)
+        dist = np.sqrt((opt_x - base_x)**2 + (opt_y - base_y)**2)
+        if dist > window:
+            # 윈도우 경계로 클리핑
+            ratio = window / dist
+            opt_x = base_x + (opt_x - base_x) * ratio
+            opt_y = base_y + (opt_y - base_y) * ratio
+            
         return float(opt_x), float(opt_y)
         
     except Exception:
-        if base_x is not None and base_y is not None: return float(base_x), float(base_y)
+        # 에러 발생 시 초기값으로 안전하게 복귀 (또는 이미지 중앙)
+        if base_x is not None and base_y is not None:
+            return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
@@ -106,22 +112,21 @@ energy_kev = st.sidebar.number_input("Energy (keV)", value=11.564, format="%.3f"
 dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f")
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
+# 빔 센터(Beam Center) 정렬 옵션 ---
 st.sidebar.divider()
 st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
+dbx = st.sidebar.number_input("DBx (Center X)", value=st.session_state.dbx, step=0.01)
+dby = st.sidebar.number_input("DBy (Center Y)", value=st.session_state.dby, step=0.01)
+track_window = st.sidebar.slider("빔 센터 트래킹 윈도우 (px)", 10, 200, 50, help="입사각 변화 시 원점 이동을 추적할 범위입니다. 0.117d->0.800d 등 이동이 크면 값을 키우세요.")
 
-# 수동 조정 입력창 (세션 상태와 연동)
-dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
-dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
-
-# [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
-if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
+# [기능 개선] 동적 자동 정렬 버튼
+if st.sidebar.button("🪄 빔 센터 미세조정 (자동 탐색)"):
     if 'current_img' in st.session_state:
-        # 화면의 Number_input에 바로 입력된 최신값(dbx, dby) 주변 ±100px 영역으로 국한하여 탐색
         dbx_a, dby_a = auto_calibrate_center(
             st.session_state.current_img, 
             base_x=dbx, 
             base_y=dby, 
-            window=100
+            window=track_window
         )
         st.session_state.dbx = dbx_a
         st.session_state.dby = dby_a
@@ -234,15 +239,17 @@ if uploaded_files:
             pbar = st.progress(0)
             
             # [동적 빔 센터 흐름 추적]
-            # 첫 샘플은 사용자가 설정한 dbx, dby를 기준으로, 다음 샘플부터는 이전 샘플의 중심을 기준으로 ±20 픽셀씩만 한정 추적
+            # 입사각 순서로 정렬하여 트래킹 연속성 확보
+            work_df = edited_df.sort_values("입사각(deg)").copy()
             track_x, track_y = dbx, dby
             
-            for i, row in edited_df.iterrows():
+            for i, (idx, row) in enumerate(work_df.iterrows()):
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
                     # 현재 샘플의 물리적 원점(Beam Center) 미세조정 탐색 및 업데이트
-                    track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=20)
+                    # 이전 샘플에서 찾은 위치를 기준으로 track_window 범위 내에서 탐색
+                    track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=track_window)
                     
                     # 입사각 보정: pyFAI rot1 파라미터로 GIWAXS 입사각 반영
                     incidence_rad = np.radians(row["입사각(deg)"])
