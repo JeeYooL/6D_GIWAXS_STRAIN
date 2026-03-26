@@ -10,6 +10,9 @@ from lmfit.models import GaussianModel, LinearModel
 import re
 import zipfile
 import io
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- 헬퍼 함수 ---
 def extract_incidence_angle(filename):
@@ -223,6 +226,7 @@ if uploaded_files:
 
     if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
         results, zip_buffer = [], io.BytesIO()
+        report_figures = []  # Word 보고서용 그래프 저장
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             pbar = st.progress(0)
             
@@ -333,6 +337,7 @@ if uploaded_files:
                             
                             ax2d.imshow(log_final, cmap=cmap_final, extent=ext)
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
+                            buf_2d = io.BytesIO(); fig2d.savefig(buf_2d, format='png', dpi=150, bbox_inches='tight'); buf_2d.seek(0)
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
                             # 1D 피팅 결과 (Out-of-plane)
@@ -341,6 +346,7 @@ if uploaded_files:
                             ax_out.plot(qc_out, fit_out.best_fit, 'r-', label='Fit')
                             ax_out.set_title(f"Out-of-plane Strain: {strain_out:.3f}%")
                             ax_out.set_xlabel(r"$q_z (\AA^{-1})$"); ax_out.legend()
+                            buf_out = io.BytesIO(); fig_out.savefig(buf_out, format='png', dpi=150, bbox_inches='tight'); buf_out.seek(0)
                             st.pyplot(fig_out); plt.close(fig_out)
                         with c3:
                             # 1D 피팅 결과 (In-plane)
@@ -349,13 +355,22 @@ if uploaded_files:
                             ax_in.plot(qc_in, fit_in.best_fit, 'r-', label='Fit')
                             ax_in.set_title(f"In-plane Strain: {strain_in:.3f}%")
                             ax_in.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax_in.legend()
+                            buf_in = io.BytesIO(); fig_in.savefig(buf_in, format='png', dpi=150, bbox_inches='tight'); buf_in.seek(0)
                             st.pyplot(fig_in); plt.close(fig_in)
+                        
+                        # Word 보고서용 그래프 저장
+                        report_figures.append({
+                            'name': row['파일명'], 'angle': row['입사각(deg)'],
+                            'strain_out': strain_out, 'strain_in': strain_in,
+                            'fig_2d': buf_2d, 'fig_out': buf_out, 'fig_in': buf_in
+                        })
                             
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
         
         st.session_state.analysis_results = pd.DataFrame(results)
         st.session_state.zip_data = zip_buffer.getvalue()
+        st.session_state.report_figures = report_figures
 
     if st.session_state.analysis_results is not None:
         st.divider(); st.subheader("📈 입사각별 Strain 트렌드")
@@ -376,4 +391,74 @@ if uploaded_files:
                 ax_tr.legend()
                 ax_tr.grid(True, linestyle='--', alpha=0.7)
                 st.pyplot(fig_tr)
+                buf_trend = io.BytesIO(); fig_tr.savefig(buf_trend, format='png', dpi=150, bbox_inches='tight'); buf_trend.seek(0)
                 plt.close(fig_tr)
+            
+            # --- Word 보고서 생성 및 다운로드 ---
+            st.divider()
+            st.subheader("📝 Word 보고서 다운로드")
+            
+            if st.button("📄 Word 보고서 생성", key="gen_docx"):
+                doc = Document()
+                doc.add_heading('GIWAXS Strain Analysis Report', level=0)
+                doc.add_paragraph(f'Bulk q-value: {q_bulk:.4f} Å⁻¹  |  Fit range: [{q_min:.2f}, {q_max:.2f}] Å⁻¹')
+                doc.add_paragraph(f'Energy: {energy_kev} keV  |  Distance: {dist_mm} mm  |  Pixel: {pixel_um} μm')
+                
+                # 1. 결과 테이블
+                doc.add_heading('1. Strain Results Table', level=1)
+                table = doc.add_table(rows=1, cols=4, style='Light Shading Accent 1')
+                hdr = table.rows[0].cells
+                hdr[0].text = '파일명'; hdr[1].text = '입사각(deg)'
+                hdr[2].text = 'Strain_Out(%)'; hdr[3].text = 'Strain_In(%)'
+                for _, r in res_df.iterrows():
+                    row_cells = table.add_row().cells
+                    row_cells[0].text = str(r['파일명'])
+                    row_cells[1].text = f"{r['입사각']:.2f}"
+                    row_cells[2].text = f"{r['Strain_Out(%)']:.3f}"
+                    row_cells[3].text = f"{r['Strain_In(%)']:.3f}"
+                
+                # 2. 트렌드 그래프
+                doc.add_heading('2. Strain Trend', level=1)
+                doc.add_picture(buf_trend, width=Inches(5.5))
+                last_paragraph = doc.paragraphs[-1]
+                last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                
+                # 3. 각 샘플별 상세 분석 (2D + Out + In)
+                doc.add_heading('3. Per-Sample Analysis', level=1)
+                figs = st.session_state.get('report_figures', [])
+                for item in figs:
+                    doc.add_heading(f"{item['name']} (Angle: {item['angle']:.2f}°)", level=2)
+                    p_info = doc.add_paragraph()
+                    p_info.add_run(f"Out-of-plane Strain: {item['strain_out']:.3f}%  |  In-plane Strain: {item['strain_in']:.3f}%")
+                    
+                    # 2D 패턴
+                    item['fig_2d'].seek(0)
+                    doc.add_picture(item['fig_2d'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    # Out-of-plane & In-plane (나란히 배치는 docx 한계로 순차 배치)
+                    item['fig_out'].seek(0)
+                    doc.add_picture(item['fig_out'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    item['fig_in'].seek(0)
+                    doc.add_picture(item['fig_in'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    doc.add_page_break()
+                
+                # 문서 저장
+                docx_buffer = io.BytesIO()
+                doc.save(docx_buffer)
+                docx_buffer.seek(0)
+                st.session_state.docx_data = docx_buffer.getvalue()
+                st.success("✅ Word 보고서가 생성되었습니다!")
+            
+            if st.session_state.get('docx_data'):
+                st.download_button(
+                    "💾 Word 보고서 다운로드 (.docx)",
+                    st.session_state.docx_data,
+                    "GIWAXS_Strain_Report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_docx"
+                )
