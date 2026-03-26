@@ -129,6 +129,11 @@ wavelength = (12.3984 / energy_kev) * 1e-10
 dist_m = dist_mm / 1000.0
 px_m = pixel_um * 1e-6
 
+# --- 사이드바: 2D 시각화 설정 ---
+st.sidebar.divider()
+st.sidebar.subheader("🎨 2D 시각화 옵션")
+mask_bg = st.sidebar.checkbox("상반원 배경 지우기 (Intensity ≤ 5)", value=True, help="배경 노이즈를 투명하게 처리하여 실제 경계선과 회절 링을 명확하게 봅니다.")
+
 st.sidebar.divider()
 st.sidebar.header("2. 분석 파라미터")
 q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format="%.4f")
@@ -191,8 +196,17 @@ if uploaded_files:
     img_preview = st.session_state.current_img
     flipped_img = np.flipud(img_preview)
     
+    # 명암(Log) 이미지 생성 및 배경 제거
+    log_preview = np.log1p(np.clip(flipped_img, 0, None))
+    if mask_bg:
+        log_preview = np.where(log_preview <= 5.0, np.nan, log_preview)
+        
     fig_pre, ax_pre = plt.subplots(figsize=(6, 4))
-    im_pre = ax_pre.imshow(np.log1p(np.clip(flipped_img, 0, None)), cmap='jet')
+    
+    cmap_pre = plt.cm.jet.copy()
+    cmap_pre.set_bad('white', 1.)
+    
+    im_pre = ax_pre.imshow(log_preview, cmap=cmap_pre)
     
     # 십자선 표시 (Flip 고려)
     h_pre, w_pre = img_preview.shape
@@ -296,8 +310,16 @@ if uploaded_files:
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
                             ext = [-track_x*dq, (w-track_x)*dq, -track_y*dq, (h-track_y)*dq]
+                            
+                            log_final = np.log1p(np.clip(np.flipud(img_data), 0, None))
+                            if mask_bg:
+                                log_final = np.where(log_final <= 5.0, np.nan, log_final)
+                                
                             fig2d, ax2d = plt.subplots()
-                            ax2d.imshow(np.log1p(np.clip(np.flipud(img_data), 0, None)), cmap='jet', extent=ext)
+                            cmap_final = plt.cm.jet.copy()
+                            cmap_final.set_bad('white', 1.)
+                            
+                            ax2d.imshow(log_final, cmap=cmap_final, extent=ext)
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
