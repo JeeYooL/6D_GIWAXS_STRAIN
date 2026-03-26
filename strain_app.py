@@ -350,20 +350,26 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            # 2D GIWAXS 패턴 (동적으로 추적된 track_x, track_y 기준)
+                            # 2D GIWAXS 패턴 — 하반원만 잘라서 상반원으로 뒤집어 표시
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
-                            ext = [-track_x*dq, (w-track_x)*dq, -track_y*dq, (h-track_y)*dq]
                             
-                            log_final = np.log1p(np.clip(np.flipud(img_data), 0, None))
+                            # 하반원 추출 (beam center 아래쪽만)
+                            lower_half = img_data[int(track_y):, :]
+                            log_lower = np.log1p(np.clip(lower_half, 0, None))
                             if mask_bg:
-                                log_final = np.where(log_final <= 5.0, np.nan, log_final)
-                                
+                                log_lower = np.where(log_lower <= 5.0, np.nan, log_lower)
+                            # 상하 뒤집기 → 링이 위로 올라가는 상반원 형태
+                            log_flipped = np.flipud(log_lower)
+                            
+                            h_lower = log_flipped.shape[0]
+                            ext = [-track_x*dq, (w-track_x)*dq, 0, h_lower*dq]
+                            
                             fig2d, ax2d = plt.subplots()
                             cmap_final = plt.cm.jet.copy()
                             cmap_final.set_bad('white', 1.)
                             
-                            ax2d.imshow(log_final, cmap=cmap_final, extent=ext)
+                            ax2d.imshow(log_flipped, cmap=cmap_final, extent=ext, aspect='auto')
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             buf_2d = io.BytesIO(); fig2d.savefig(buf_2d, format='png', dpi=150, bbox_inches='tight'); buf_2d.seek(0)
                             st.pyplot(fig2d); plt.close(fig2d)
@@ -495,65 +501,3 @@ if uploaded_files:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key="dl_docx"
                 )
-            
-            # --- Williamson-Hall Plot 분석 ---
-            st.divider()
-            st.subheader("📐 Williamson-Hall Plot (Macrostrain vs Microstrain 비교)")
-            st.caption("β·cos(θ) vs 4·sin(θ) — 기울기 = microstrain(ε), y절편 = Kλ/D (결정립 크기)")
-            
-            lambda_A = (12.3984 / energy_kev)  # Å
-            wh_data = st.session_state.get('wh_results', [])
-            
-            for _, r_row in res_df.iterrows():
-                # results에서 diagnostics 꺼내기
-                match_res = [x for x in wh_data if x['파일명'] == r_row['파일명']]
-                if not match_res or 'diag_out' not in match_res[0]:
-                    continue
-                diag_o = match_res[0]['diag_out']
-                diag_i = match_res[0]['diag_in']
-                
-                with st.expander(f"📐 W-H: {r_row['파일명']} (입사각 {r_row['입사각']:.2f}°)"):
-                    for direction, diag, macro_s in [('Out-of-plane', diag_o, r_row['Strain_Out(%)']),
-                                                      ('In-plane', diag_i, r_row['Strain_In(%)'])]:
-                        all_p = diag.get('all_peaks', [])
-                        if len(all_p) < 2:
-                            st.info(f"{direction}: 피크 {len(all_p)}개 — W-H 분석에는 최소 2개 필요")
-                            continue
-                        
-                        # q → 2θ 변환 및 W-H 데이터 계산
-                        sin_vals, beta_cos_vals = [], []
-                        for pk in all_p:
-                            q_val = pk['q']
-                            fwhm_q = pk['fwhm_q']
-                            theta = np.arcsin(q_val * lambda_A / (4 * np.pi))  # Bragg angle
-                            # FWHM 변환: β_2θ = FWHM_q · λ / (2π·cos(θ))
-                            beta_2theta = fwhm_q * lambda_A / (2 * np.pi * np.cos(theta))
-                            sin_vals.append(4 * np.sin(theta))
-                            beta_cos_vals.append(beta_2theta * np.cos(theta))
-                        
-                        x_wh = np.array(sin_vals)
-                        y_wh = np.array(beta_cos_vals)
-                        
-                        # 선형 회귀: y = slope * x + intercept
-                        if len(x_wh) >= 2:
-                            coeffs = np.polyfit(x_wh, y_wh, 1)
-                            micro_strain = coeffs[0]  # 기울기 = microstrain
-                            y_intercept = coeffs[1]   # Kλ/D
-                            K = 0.9
-                            crystallite_size = K * lambda_A / y_intercept if y_intercept > 0 else float('inf')
-                            
-                            fig_wh, ax_wh = plt.subplots(figsize=(5, 3.5))
-                            ax_wh.scatter(x_wh, y_wh, c='blue', s=50, zorder=5)
-                            x_fit = np.linspace(x_wh.min() * 0.9, x_wh.max() * 1.1, 50)
-                            ax_wh.plot(x_fit, np.polyval(coeffs, x_fit), 'r--', label=f'ε={micro_strain:.5f}')
-                            ax_wh.set_xlabel(r'$4\sin\theta$')
-                            ax_wh.set_ylabel(r'$\beta\cos\theta$ (rad)')
-                            ax_wh.set_title(f'{direction} W-H Plot', fontsize=10)
-                            ax_wh.legend(fontsize=8)
-                            ax_wh.grid(True, alpha=0.3)
-                            st.pyplot(fig_wh); plt.close(fig_wh)
-                            
-                            c1, c2 = st.columns(2)
-                            c1.metric("Macrostrain (단일 피크)", f"{macro_s:.3f}%")
-                            c2.metric("Microstrain (W-H)", f"{micro_strain*100:.4f}%")
-                            st.caption(f"결정립 크기 추정: {crystallite_size:.1f} Å ({crystallite_size/10:.1f} nm) | 피크 {len(all_p)}개 사용")
