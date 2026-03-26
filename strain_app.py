@@ -7,6 +7,7 @@ import fabio
 import pyFAI
 from pyFAI.azimuthalIntegrator import AzimuthalIntegrator
 from lmfit.models import GaussianModel, PseudoVoigtModel, LinearModel, PolynomialModel
+from scipy.signal import find_peaks
 import re
 import zipfile
 import io
@@ -16,7 +17,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- 헬퍼 함수 ---
 def extract_incidence_angle(filename):
-    match = re.search(r"(\d+\.\d+)d", filename)
+    match = re.search(r"_(\d+\.\d+)d", filename)
+    if not match:
+        match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
 # [NEW] 회절 링(Ring) 기반 Azimuthal Variance Minimization 원점 탐색
@@ -138,6 +141,8 @@ mask_bg = st.sidebar.checkbox("상반원 배경 지우기 (Intensity ≤ 5)", va
 st.sidebar.divider()
 st.sidebar.header("2. 분석 파라미터")
 q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format="%.4f")
+target_q = st.sidebar.number_input("Target Peak q (Å⁻¹)", value=q_bulk, format="%.4f", help="추적할 특정 피크의 q값. q_bulk와 같거나 근처로 설정.")
+peak_window = st.sidebar.number_input("피크 선택 창(±Å⁻¹)", value=0.05, format="%.3f", help="target_q ± 이 범위 안의 피크만 선택. 작을수록 정확, 클수록 유연.")
 q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.30)
 q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.65)
 
@@ -239,9 +244,13 @@ if uploaded_files:
                     # 현재 샘플의 물리적 원점(Beam Center) 미세조정 탐색 및 업데이트
                     track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=20)
                     
+                    # 입사각 보정: pyFAI rot1 파라미터로 GIWAXS 입사각 반영
+                    incidence_rad = np.radians(row["입사각(deg)"])
+                    
                     # 각 이미지만의 고유하게 틀어진 빔 센터를 바탕으로 pyFAI 물리적 엔진 초기화
                     geo = AzimuthalIntegrator(dist=dist_m, poni1=track_y*px_m, poni2=track_x*px_m, 
-                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m)
+                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m,
+                                              rot1=incidence_rad)
                                               
                     q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
                     q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
@@ -252,8 +261,6 @@ if uploaded_files:
 
                     # --- [Multi-Peak Pseudo-Voigt Fitting] ---
                     def fit_peak(q, I):
-                        from scipy.signal import find_peaks
-                        
                         # 사용자가 지정한 q 범위에서 직접 피팅 (안정적)
                         mask = (q >= q_min) & (q <= q_max)
                         qc, Ic = q[mask], I[mask]
@@ -289,12 +296,12 @@ if uploaded_files:
                         # 3. 피팅 수행
                         out = model.fit(Ic, params, x=qc)
                         
-                        # 4. q_bulk 근방(±0.15) 중 amplitude 최대 피크 선택
+                        # 4. target_q ± peak_window 안의 피크만 후보로 선택
                         candidates = []
                         for j in range(len(peaks)):
                             c_val = out.params[f'p{j}_center'].value
                             a_val = out.params[f'p{j}_amplitude'].value
-                            if abs(c_val - q_bulk) < 0.15:
+                            if abs(c_val - target_q) < peak_window:
                                 candidates.append((c_val, a_val, j))
                         
                         if candidates:
@@ -302,11 +309,11 @@ if uploaded_files:
                             best_center, best_idx = best[0], best[2]
                         else:
                             centers = [out.params[f'p{j}_center'].value for j in range(len(peaks))]
-                            best_center = min(centers, key=lambda c: abs(c - q_bulk))
+                            best_center = min(centers, key=lambda c: abs(c - target_q))
                             best_idx = 0
                         
-                        # 5. Strain 계산 + 진단
-                        strain = (q_bulk - best_center) / q_bulk * 100
+                        # 5. Strain 계산 (d-spacing 기반 정확 공식: ε = q₀/q - 1)
+                        strain = (q_bulk / best_center - 1) * 100
                         
                         sigma_fit = out.params[f'p{best_idx}_sigma'].value
                         fwhm_fit = sigma_fit * 2.355
