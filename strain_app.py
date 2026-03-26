@@ -350,26 +350,24 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            # 2D GIWAXS 패턴 — 하반원만 잘라서 상반원으로 뒤집어 표시
+                            # 2D GIWAXS 패턴 — 실제 데이터(하반원)를 상반원으로 표시
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
                             
-                            # 하반원 추출 (beam center 아래쪽만)
-                            lower_half = img_data[int(track_y):, :]
-                            log_lower = np.log1p(np.clip(lower_half, 0, None))
+                            # 실제 회절 데이터가 있는 반쪽 추출 (raw 상단 = 화면 하반원)
+                            data_half = img_data[:int(track_y), :]
+                            log_half = np.log1p(np.clip(data_half, 0, None))
                             if mask_bg:
-                                log_lower = np.where(log_lower <= 5.0, np.nan, log_lower)
-                            # 상하 뒤집기 → 링이 위로 올라가는 상반원 형태
-                            log_flipped = np.flipud(log_lower)
+                                log_half = np.where(log_half <= 5.0, np.nan, log_half)
                             
-                            h_lower = log_flipped.shape[0]
-                            ext = [-track_x*dq, (w-track_x)*dq, 0, h_lower*dq]
+                            h_half = log_half.shape[0]
+                            ext = [-track_x*dq, (w-track_x)*dq, 0, h_half*dq]
                             
                             fig2d, ax2d = plt.subplots()
                             cmap_final = plt.cm.jet.copy()
                             cmap_final.set_bad('white', 1.)
                             
-                            ax2d.imshow(log_flipped, cmap=cmap_final, extent=ext, aspect='auto')
+                            ax2d.imshow(log_half, cmap=cmap_final, extent=ext, aspect='auto')
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             buf_2d = io.BytesIO(); fig2d.savefig(buf_2d, format='png', dpi=150, bbox_inches='tight'); buf_2d.seek(0)
                             st.pyplot(fig2d); plt.close(fig2d)
