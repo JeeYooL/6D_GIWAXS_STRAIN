@@ -42,8 +42,25 @@ st.sidebar.info("💡 실제 데이터가 있는 하반원을 사용하려면 -1
 azi_min = st.sidebar.number_input("최소 Azimuth (°)", value=-180) # 데이터가 있는 하반원 기준
 azi_max = st.sidebar.number_input("최대 Azimuth (°)", value=0)
 
-# --- 파일 업로드 ---
-uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+# --- 파일 업로드 방식 결정 ---
+st.sidebar.subheader("📂 데이터 업로드 방식")
+use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
+
+uploaded_files = []
+if use_sample_data:
+    sample_dir = "sample_data"
+    if os.path.exists(sample_dir):
+        for fname in os.listdir(sample_dir):
+            if fname.lower().endswith(('.tif', '.tiff')):
+                fpath = os.path.join(sample_dir, fname)
+                with open(fpath, "rb") as f:
+                    file_obj = io.BytesIO(f.read())
+                    file_obj.name = fname
+                    uploaded_files.append(file_obj)
+    if not uploaded_files:
+        st.sidebar.warning(f"❌ `{sample_dir}` 폴더가 비어 있거나 TIF 파일이 없습니다. 파일을 넣어주세요!")
+else:
+    uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
 
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
@@ -140,16 +157,19 @@ if uploaded_files:
         st.divider()
         st.subheader("📈 입사각별 Strain 트렌드")
         
-        c1, c2 = st.columns([1, 1.5])
-        with c1:
-            st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
-            st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv")
-            st.download_button("📂 Origin용 TXT 저장", st.session_state.zip_data, "origin_data.zip", key="dl_zip")
-            
-        with c2:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-', label='Strain (%)')
-            ax.set_xlabel("Incidence Angle (deg)")
-            ax.set_ylabel("Strain (%)")
-            ax.grid(True, linestyle='--', alpha=0.7)
-            st.pyplot(fig)
+        if res_df.empty:
+            st.warning("⚠️ 성공적으로 분석된 데이터가 없습니다. 피크가 잡히지 않았거나 데이터가 부족합니다. 적분 각도(Azimuth)와 Fit(q) 영역을 다시 조절해 보세요.")
+        else:
+            c1, c2 = st.columns([1, 1.5])
+            with c1:
+                st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
+                st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv")
+                st.download_button("📂 Origin용 TXT 저장", st.session_state.zip_data, "origin_data.zip", key="dl_zip")
+                
+            with c2:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                ax.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-', label='Strain (%)')
+                ax.set_xlabel("Incidence Angle (deg)")
+                ax.set_ylabel("Strain (%)")
+                ax.grid(True, linestyle='--', alpha=0.7)
+                st.pyplot(fig)
