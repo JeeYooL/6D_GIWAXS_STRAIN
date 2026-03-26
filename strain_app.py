@@ -16,42 +16,89 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [복원 및 강화] 물리적 지평선(Horizon) 및 빔스탑 탐지
-def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
+# [NEW] 원형 허프 변환(Circle Hough Transform) 기반 자동 빔 센터 탐지
+def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     try:
+        from skimage import feature, transform
+        from skimage.filters import gaussian
+        import numpy as np
+        
         h, w = img_data.shape
         
-        # 1. 핫픽셀 및 극단적인 노이즈 자르기
+        # 1. 아티팩트 및 컬러바 방지를 위한 전역 마스킹 공간 (극단 가장자리 배제)
+        # 연구원님의 팁(ROI 설정) 완벽 반영
+        margin_x = int(w * 0.10)
+        margin_y = int(h * 0.10)
+        
+        if base_x is not None and base_y is not None:
+            # 동적/미세조정 추적 모드: 수동 입력 근방을 넓게(window*3=300px 이상) 잡아서 휘어진 링의 온전한 호(Arc)를 파악
+            roi_radius = max(int(window * 3), 500)
+            x_min = max(margin_x, int(base_x - roi_radius))
+            x_max = min(w - margin_x, int(base_x + roi_radius))
+            y_min = max(margin_y, int(base_y - roi_radius))
+            y_max = min(h - margin_y, int(base_y + roi_radius))
+        else:
+            # 전체 초기 탐색(Global Search) 모드: 중앙 80% 영역에서 원형 링을 집중 탐색
+            x_min, x_max = margin_x, w - margin_x
+            y_min, y_max = margin_y, h - margin_y
+            
+        roi_img = img_data[y_min:y_max, x_min:x_max]
+        
+        # 2. X선 데이터의 넓은 강도를 압축: 로그 스케일링 (흐릿한 외곽 링 가시성 폭발적 향상)
+        p99 = np.percentile(roi_img, 99.5)
+        clipped_roi = np.clip(roi_img, 0, p99)
+        log_img = np.log1p(clipped_roi)
+        
+        # 3. 전처리: Canny 엣지 검출을 극대화하기 위한 가우시안 노이즈 제거
+        blurred_img = gaussian(log_img, sigma=2)
+        
+        # 4. Canny 엣지 검출 (산란 링 테두리 찾기)
+        edges = feature.canny(blurred_img, sigma=3, low_threshold=0.1, high_threshold=0.2)
+        
+        # 5. 허프 변환(Hough Transform) 원 중심 찾기
+        # 반지름 탐색 범위를 넓게 조정 (GIWAXS 특성상 링 크기가 다양함)
+        hough_radii = np.arange(100, min(roi_img.shape)//2, 50)
+        hough_res = transform.hough_circle(edges, hough_radii)
+        
+        # 가장 강력한 링 곡률 모델(total_num_peaks=1) 1개의 중심(기하학적 Origin) 추출
+        accums, cx, cy, radii = transform.hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
+        
+        if len(cx) > 0:
+            # ROI 기준(cx, cy) 좌표를 전체 원본 해상도(x_min, y_min 오프셋) 절대 좌표계로 변환
+            final_x = float(x_min + cx[0])
+            final_y = float(y_min + cy[0])
+            return final_x, final_y
+        else:
+            # 희박한 확률로 원을 못 찾았을 경우 Fallback 호출
+            raise ValueError("허프 변환으로 기하학적 산란 링(Circle)을 찾지 못했습니다.")
+            
+    except Exception as e:
+        # skimage가 설치되지 않았거나, 허프 변환 실패 시 예전 물리적 지평선 로직으로 안전하게 폴백(Fallback)
+        return _fallback_calibrate_center(img_data, base_x, base_y, window)
+
+
+# [안전용 백업] 기존 지평선 및 빔스탑 찾기 Fallback 엔진
+def _fallback_calibrate_center(img_data, base_x=None, base_y=None, window=20):
+    try:
+        h, w = img_data.shape
         p99 = np.percentile(img_data, 99.5)
         clipped = np.clip(img_data, 0, p99)
         
         if base_x is not None and base_y is not None:
-            # --- 동적 추적(Tracking) 모드 ---
-            # 이전 중심(base_x, base_y) 근방(±window)에서만 탐색
-            y_min = max(0, int(base_y - window))
-            y_max = min(h, int(base_y + window + 1))
-            x_min = max(0, int(base_x - window))
-            x_max = min(w, int(base_x + window + 1))
+            y_min, y_max = max(0, int(base_y - window)), min(h, int(base_y + window + 1))
+            x_min, x_max = max(0, int(base_x - window)), min(w, int(base_x + window + 1))
             
-            # 추적 제한 구역 내에서 수직 그라디언트 최대 지점(지평선) 찾기
             v_profile = np.sum(clipped[y_min:y_max, x_min:x_max], axis=1)
             v_gradient = np.abs(np.diff(v_profile))
             dby_auto = y_min + np.argmax(v_gradient)
             
-            # 찾은 지평선(Horizon) 위에서 가장 어두운 픽셀 찾기
-            # 그림자나 노이즈에 속지 않고 '거대한 덩어리(빔스탑)'의 정중앙을 찾기 위해 부드럽게 뭉갬
             from scipy.ndimage import gaussian_filter1d
             h_profile = clipped[dby_auto, x_min:x_max]
             h_smooth = gaussian_filter1d(h_profile, sigma=5)
             dbx_auto = x_min + np.argmin(h_smooth)
-            
             return float(dbx_auto), float(dby_auto)
-            
         else:
-            # --- 전체 1단계 초기 탐색 (Global Search) 모드 ---
-            margin_x = int(w * 0.20)
-            margin_y = int(h * 0.10)
-            
+            margin_x, margin_y = int(w * 0.20), int(h * 0.10)
             safe_region = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
             
             v_profile = np.sum(safe_region, axis=1)
@@ -60,11 +107,9 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
             
             h_profile = safe_region[dby_auto - margin_y, :]
             dbx_auto = margin_x + np.argmin(h_profile)
-            
             return float(dbx_auto), float(dby_auto)
             
     except Exception:
-        # 안전 장치: 모두 실패 시 이전 중심 반환 또는 대략 중앙 반환
         if base_x is not None and base_y is not None: return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
 
