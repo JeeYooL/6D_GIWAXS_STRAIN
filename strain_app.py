@@ -194,28 +194,26 @@ if uploaded_files:
     # --- [검증용] 실시간 2D 프리뷰 (센터 표시) ---
     st.subheader("🖼️ 현재 빔 센터 정렬 확인 (Preview) - 가장 위의 이미지 기준")
     img_preview = st.session_state.current_img
-    flipped_img = np.flipud(img_preview)
+    h_pre, w_pre = img_preview.shape
     
-    # 명암(Log) 이미지 생성 및 배경 제거
-    log_preview = np.log1p(np.clip(flipped_img, 0, None))
-    if mask_bg:
-        log_preview = np.where(log_preview <= 5.0, np.nan, log_preview)
-        
-    fig_pre, ax_pre = plt.subplots(figsize=(6, 4))
+    # 빔 원점(dby) 아래 하반원만 잘라낸 후 → Flip해서 상반원처럼 표시
+    cy = int(dby) if dby is not None else h_pre // 2
+    lower_half = img_preview[cy:, :]            # 원점 아래의 하반원
+    lower_flipped = np.flipud(lower_half)       # 위아래 반전 → 반원이 위쪽으로 솟아오르는 표준 GIWAXS 뷰
+    log_preview = np.log1p(np.clip(lower_flipped, 0, None))
     
+    fig_pre, ax_pre = plt.subplots(figsize=(8, 4))
     cmap_pre = plt.cm.jet.copy()
     cmap_pre.set_bad('white', 1.)
+    im_pre = ax_pre.imshow(log_preview, cmap=cmap_pre, aspect='auto')
     
-    im_pre = ax_pre.imshow(log_preview, cmap=cmap_pre)
-    
-    # 십자선 표시 (Flip 고려)
-    h_pre, w_pre = img_preview.shape
-    if dbx is not None and dby is not None:
+    # 원점 X 위치만 수직선으로 표시 (Y=0이 원점이 됨)
+    if dbx is not None:
         ax_pre.axvline(x=dbx, color='white', linestyle='--', linewidth=0.8, alpha=0.7)
-        ax_pre.axhline(y=h_pre-dby, color='white', linestyle='--', linewidth=0.8, alpha=0.7)
-        ax_pre.scatter(dbx, h_pre-dby, color='red', s=100, marker='+', label='Current Center')
+        ax_pre.axhline(y=lower_flipped.shape[0]-1, color='white', linestyle='--', linewidth=0.8, alpha=0.3)
+        ax_pre.scatter(dbx, lower_flipped.shape[0]-1, color='red', s=100, marker='+', label='Beam Center')
     
-    ax_pre.set_title(f"Center Preview (X={dbx:.1f}, Y={dby:.1f})")
+    ax_pre.set_title(f"하반원 → 상반원 변환 Preview (X={dbx:.1f}, Y={dby:.1f})")
     plt.colorbar(im_pre, ax=ax_pre)
     st.pyplot(fig_pre)
     plt.close(fig_pre)
@@ -306,20 +304,21 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            # 2D GIWAXS 패턴 (동적으로 추적된 track_x, track_y 기준)
+                            # 2D GIWAXS 패턴: 원점 아래 하반원만 자르고 Flip → 상반원 GIWAXS 표준 뷰
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
-                            ext = [-track_x*dq, (w-track_x)*dq, -track_y*dq, (h-track_y)*dq]
+                            cy2 = int(track_y)
+                            lower = img_data[cy2:, :]               # 원점 아래쪽만
+                            lower_f = np.flipud(lower)              # 뒤집어서 위로
+                            log_final = np.log1p(np.clip(lower_f, 0, None))
+                            lh = lower_f.shape[0]
+                            # extent: qxy축 전체, qz축은 0 ~ lh*dq (원점부터 위로)
+                            ext = [-track_x*dq, (w-track_x)*dq, 0, lh*dq]
                             
-                            log_final = np.log1p(np.clip(np.flipud(img_data), 0, None))
-                            if mask_bg:
-                                log_final = np.where(log_final <= 5.0, np.nan, log_final)
-                                
                             fig2d, ax2d = plt.subplots()
                             cmap_final = plt.cm.jet.copy()
                             cmap_final.set_bad('white', 1.)
-                            
-                            ax2d.imshow(log_final, cmap=cmap_final, extent=ext)
+                            ax2d.imshow(log_final, cmap=cmap_final, extent=ext, aspect='auto', origin='upper')
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
