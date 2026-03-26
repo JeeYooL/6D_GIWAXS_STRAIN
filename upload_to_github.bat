@@ -6,6 +6,7 @@ echo.
 
 git add .
 git commit -m "Auto update via upload_to_github.bat"
+git pull --no-edit
 git push
 
 echo.
