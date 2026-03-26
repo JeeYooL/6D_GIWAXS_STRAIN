@@ -98,9 +98,16 @@ else:
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
     
-    # 자동 정렬을 위해 첫 번째 이미지 미리 로드
+    # [수정] fabio.open() 에러 방지를 위해 우선 모든 파일을 물리적 저장소에 기록
+    temp_dir = "temp_giwaxs"
+    os.makedirs(temp_dir, exist_ok=True)
+    paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
+    for uf in uploaded_files:
+        with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
+    
+    # 물리적으로 저장된 첫 번째 이미지를 읽어서 캐싱
     if 'current_img' not in st.session_state or st.session_state.first_file != file_list[0]:
-        st.session_state.current_img = fabio.open(uploaded_files[0]).data
+        st.session_state.current_img = fabio.open(paths[file_list[0]]).data
         st.session_state.first_file = file_list[0]
 
     if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
@@ -132,13 +139,7 @@ if uploaded_files:
     st.info("💡 위 이미지의 **빨간 십자선(+)**이 파란색 빔스탑의 정중앙에 위치하는지 확인하시고 아래 버튼을 누르세요.")
 
     if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
-        temp_dir = "temp_giwaxs"
-        os.makedirs(temp_dir, exist_ok=True)
-        paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
-        for uf in uploaded_files:
-            with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
-
-        # pyFAI 엔진 설정
+        # pyFAI 엔진 설정 (파일은 이미 로딩 과정에서 temp_dir에 저장 완료됨)
         geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
                                   wavelength=wavelength, pixel1=px_m, pixel2=px_m)
         
