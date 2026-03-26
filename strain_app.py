@@ -97,13 +97,13 @@ st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
 st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
 
 # --- 세션 상태 초기화 (자동 정렬 값 유지) ---
-if 'dbx' not in st.session_state: st.session_state.dbx = 1440.36
-if 'dby' not in st.session_state: st.session_state.dby = 1053.49
+if 'dbx' not in st.session_state: st.session_state.dbx = 1435.83
+if 'dby' not in st.session_state: st.session_state.dby = 1439.11
 
 # --- 사이드바: 실험 셋업 ---
 st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
 energy_kev = st.sidebar.number_input("Energy (keV)", value=11.564, format="%.3f")
-dist_mm = st.sidebar.number_input("SDD (mm)", value=100.0, format="%.3f")
+dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f")
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
 st.sidebar.divider()
@@ -140,20 +140,20 @@ mask_bg = st.sidebar.checkbox("상반원 배경 지우기 (Intensity ≤ 5)", va
 
 st.sidebar.divider()
 st.sidebar.header("2. 분석 파라미터")
-q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format="%.4f")
+q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.05, format="%.4f")
 target_q = st.sidebar.number_input("Target Peak q (Å⁻¹)", value=q_bulk, format="%.4f", help="추적할 특정 피크의 q값. q_bulk와 같거나 근처로 설정.")
 peak_window = st.sidebar.number_input("피크 선택 창(±Å⁻¹)", value=0.05, format="%.3f", help="target_q ± 이 범위 안의 피크만 선택. 작을수록 정확, 클수록 유연.")
-q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.30)
-q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.65)
+q_min = st.sidebar.number_input("Fit 영역 시작 q", value=0.95)
+q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.15)
 
 st.sidebar.subheader("🎯 1D 적분 각도 (Out / In-plane)")
 c_out1, c_out2 = st.sidebar.columns(2)
-azi_out_min = c_out1.number_input("Out 최소(°)", value=-110)
-azi_out_max = c_out2.number_input("Out 최대(°)", value=-70)
+azi_out_min = c_out1.number_input("Out 최소(°)", value=-100)
+azi_out_max = c_out2.number_input("Out 최대(°)", value=-80)
 
 c_in1, c_in2 = st.sidebar.columns(2)
-azi_in_min = c_in1.number_input("In 최소(°)", value=-20)
-azi_in_max = c_in2.number_input("In 최대(°)", value=0)
+azi_in_min = c_in1.number_input("In 최소(°)", value=-21)
+azi_in_max = c_in2.number_input("In 최대(°)", value=-1)
 
 # --- 파일 업로드 방식 결정 ---
 st.sidebar.subheader("📂 데이터 업로드 방식")
