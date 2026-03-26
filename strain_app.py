@@ -129,6 +129,7 @@ if uploaded_files:
                             ax2d.set_title("2D GIWAXS (Vertical Flipped)")
                             plt.colorbar(im, ax=ax2d)
                             st.pyplot(fig2d)
+                            plt.close(fig2d)
                         with col2:
                             # 1D 피팅 결과 출력
                             fig1d, ax1d = plt.subplots()
@@ -140,6 +141,7 @@ if uploaded_files:
                             ax1d.legend()
                             ax1d.grid(True, alpha=0.3)
                             st.pyplot(fig1d)
+                            plt.close(fig1d)
                             
                 except Exception as e:
                     st.error(f"❌ {row['파일명']} 실패: {e}")
