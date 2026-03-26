@@ -16,109 +16,60 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [NEW] 대칭성 극대화(Phase Cross-Correlation) 기반 자동 빔 센터 탐지
+# [NEW] 2D 가우시안 덩어리(Blob) 탐색 기반 자동 빔 센터 미세조정
 def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     try:
         import numpy as np
-        from skimage import filters, registration, transform
+        from scipy.ndimage import gaussian_filter
         
         h, w = img_data.shape
         
-        # 1. 아티팩트 및 컬러바 방지를 위한 전역 마스킹 (연구원님 팁 강력 반영)
-        # 안전한 슬라이싱을 위해 좌우 10%, 상하 5% 정도 마진을 자름
-        margin_x = int(w * 0.15)
-        margin_y = int(h * 0.15)
-        
-        # 2. X선 데이터 처리: 노이즈 자르기, 로그 스케일링, 블러
-        p99 = np.percentile(img_data, 99.5)
-        clipped = np.clip(img_data, 0, p99)
-        
-        # 중심부 실제 데이터 영역만 슬라이싱 (텍스트, 컬러바 완전 제외)
-        raw_data = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
-        
-        # 로그 스케일링: 강도 차이를 줄여 회절 링 구조 부각
-        processed_data = np.log1p(raw_data)
-        
-        # 가우시안 블러링: 미세 노이즈 제거
-        processed_data = filters.gaussian(processed_data, sigma=3)
-        
-        # 3. 초기 중심 추정 (간단하게 중심 좌표 사용 혹은 수동 입력값 연동)
-        ph, pw = processed_data.shape
-        if base_x is not None and base_y is not None:
-            # 원본 좌표계(base_x)에서 슬라이싱된 마진만큼 오프셋 적용
-            initial_cx = base_x - margin_x
-            initial_cy = base_y - margin_y
-        else:
-            initial_cx, initial_cy = pw // 2, ph // 2
-            
-        def optimize_center(img, cx, cy):
-            """이미지를 180도 회전시킨 후, 원본과 가장 잘 일치하는 평행 이동 값을 찾습니다."""
-            img_orig = img.copy()
-            # 180도 회전된 이미지
-            img_rot = transform.rotate(img, 180, center=(cx, cy), preserve_range=True)
-            
-            # 대칭성을 이용하여 미세 이동량 계산 (sub-pixel 정밀도)
-            result = registration.phase_cross_correlation(img_orig, img_rot, upsample_factor=10)
-            
-            # 구버전/신버전 호환용 튜플 체크
-            detected_shift = result[0] if isinstance(result, tuple) else result
-            
-            # 이동량의 절반만큼 보정
-            refined_cx = cx - detected_shift[1] / 2.0
-            refined_cy = cy - detected_shift[0] / 2.0
-            return float(refined_cx), float(refined_cy)
-
-        # (1단계) 초기 중심에서 탐색 시작
-        intermediate_cx, intermediate_cy = optimize_center(processed_data, initial_cx, initial_cy)
-        
-        # (2단계) 더 정밀한 탐색을 위해 한 번 더 반복 실행
-        final_cx, final_cy = optimize_center(processed_data, intermediate_cx, intermediate_cy)
-        
-        # 슬라이싱된 이미지의 피팅 좌표를 전체 해상도 원본 이미지 좌표계로 복원
-        final_cx_original = final_cx + margin_x
-        final_cy_original = final_cy + margin_y
-        
-        return float(final_cx_original), float(final_cy_original)
-        
-    except Exception as e:
-        import traceback
-        # 예기치 않은 모듈 에러 시 구버전 안전 로직으로 폴백
-        return _fallback_calibrate_center(img_data, base_x, base_y, window)
-
-
-# [안전용 백업] 기존 지평선 및 빔스탑 찾기 Fallback 엔진
-def _fallback_calibrate_center(img_data, base_x=None, base_y=None, window=20):
-    try:
-        h, w = img_data.shape
+        # 1. 핫픽셀 및 노이즈 자르기
         p99 = np.percentile(img_data, 99.5)
         clipped = np.clip(img_data, 0, p99)
         
         if base_x is not None and base_y is not None:
-            y_min, y_max = max(0, int(base_y - window)), min(h, int(base_y + window + 1))
-            x_min, x_max = max(0, int(base_x - window)), min(w, int(base_x + window + 1))
+            # --- 동적 추적(Tracking) / 미세조정 모드 ---
+            # 사용자 입력 기준 근방(±window)에서만 탐색 (수평선에 얽매이지 않고 철저하게 독립적인 X, Y 탐색)
+            y_min = max(0, int(base_y - window))
+            y_max = min(h, int(base_y + window + 1))
+            x_min = max(0, int(base_x - window))
+            x_max = min(w, int(base_x + window + 1))
             
-            v_profile = np.sum(clipped[y_min:y_max, x_min:x_max], axis=1)
-            v_gradient = np.abs(np.diff(v_profile))
-            dby_auto = y_min + np.argmax(v_gradient)
+            local_region = clipped[y_min:y_max, x_min:x_max]
             
-            from scipy.ndimage import gaussian_filter1d
-            h_profile = clipped[dby_auto, x_min:x_max]
-            h_smooth = gaussian_filter1d(h_profile, sigma=5)
-            dbx_auto = x_min + np.argmin(h_smooth)
+            # 파란색 빔스탑은 주변(노란색 회절링 등)보다 압도적으로 강도가 낮음
+            # 연구원님 아이디어(급격한 차이가 나는 두 값의 사이 지점을 원점으로 인식하자)를 수학적으로 완벽하게 구현하는 방법은
+            # 이미지를 "크게 뭉개서(Blur)" 가장 거대한 빈 공간(Center of Mass)의 중심을 찾는 것임!
+            # 단일 데드 픽셀이나 얇은 선(Arm)에 속지 않도록 강력한 가우시안 블러 크기(sigma=15) 적용
+            smoothed_local = gaussian_filter(local_region, sigma=15)
+            
+            # 뭉개진 이미지에서 가장 어두운 픽셀 = 가장 거대한 빔스탑 덩어리의 정중앙
+            dy, dx = np.unravel_index(np.argmin(smoothed_local), smoothed_local.shape)
+            
+            dbx_auto = x_min + dx
+            dby_auto = y_min + dy
+            
             return float(dbx_auto), float(dby_auto)
+            
         else:
-            margin_x, margin_y = int(w * 0.20), int(h * 0.10)
+            # --- 전체 1단계 초기 탐색 (Global Search) 모드 ---
+            margin_x = int(w * 0.20)
+            margin_y = int(h * 0.10)
             safe_region = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
             
-            v_profile = np.sum(safe_region, axis=1)
-            v_gradient = np.abs(np.diff(v_profile))
-            dby_auto = margin_y + np.argmax(v_gradient)
+            # 전체 화면 탐색 시에는 아티팩트 방지를 위해 더 강력하게 뭉갬
+            smoothed_safe = gaussian_filter(safe_region, sigma=30)
             
-            h_profile = safe_region[dby_auto - margin_y, :]
-            dbx_auto = margin_x + np.argmin(h_profile)
+            dy, dx = np.unravel_index(np.argmin(smoothed_safe), smoothed_safe.shape)
+            
+            dbx_auto = margin_x + dx
+            dby_auto = margin_y + dy
+            
             return float(dbx_auto), float(dby_auto)
             
     except Exception:
+        # 안전 장치: 모두 실패 시 이전 중심 반환 또는 대략 중앙 반환
         if base_x is not None and base_y is not None: return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
 
