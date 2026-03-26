@@ -26,15 +26,10 @@ dist_mm = st.sidebar.number_input("SDD (mm)", value=100.0, format="%.3f") # SDD 
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
 st.sidebar.divider()
-st.sidebar.subheader("🎯 빔 센터(Beam Center) 자동 정렬")
-st.sidebar.info("💡 $q=0$ 원점이 직접 빔과 빗나가는 경우 자동 찾기를 권장합니다.")
-use_auto_center = st.sidebar.checkbox("✅ 이미지에서 빔 센터 자동 추적", value=True, help="상위 0.1% 가장 밝은 영역의 무게중심을 계산하여 자동으로 빔 센터를 맞춥니다.")
-
-if not use_auto_center:
-    dbx_manual = st.sidebar.number_input("DBx (Center X - 1)", value=1440.36)
-    dby_manual = st.sidebar.number_input("DBy (Center Y - 1)", value=1053.49)
-else:
-    dbx_manual, dby_manual = None, None
+st.sidebar.subheader("🎯 빔 센터(Beam Center) 수동 정렬")
+st.sidebar.info("💡 파란색 빔스탑 중심이 $q=0$에 오도록 X, Y를 조절하세요.")
+dbx = st.sidebar.number_input("DBx (Center X - 1)", value=1500.00)
+dby = st.sidebar.number_input("DBy (Center Y - 1)", value=1500.00)
 
 wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
@@ -96,24 +91,7 @@ if uploaded_files:
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
-                    # [자동 정렬] 빔 센터 계산
-                    if use_auto_center:
-                        threshold = np.percentile(img_data, 99.9)
-                        # '>' 대신 '>='를 사용하여 포화(Saturated)된 픽셀 그룹 전체가 누락되는 현상 방지
-                        mask = img_data >= threshold
-                        y_idx, x_idx = np.nonzero(mask)
-                        
-                        weights = img_data[mask]
-                        if len(weights) == 0 or np.sum(weights) <= 0:
-                            # 예외 처리: 마스크가 비었거나 값이 이상할 경우, 단순 글로벌 최댓값 픽셀로 지정
-                            dby, dbx = np.unravel_index(np.argmax(img_data), img_data.shape)
-                        else:
-                            dby = np.average(y_idx, weights=weights)
-                            dbx = np.average(x_idx, weights=weights)
-                    else:
-                        dbx, dby = dbx_manual, dby_manual
-
-                    # pyFAI 엔진 (물리적 계산용 - 이미지마다 동적 원점 갱신)
+                    # pyFAI 엔진 (각 이미지별로 빔 센터 반영)
                     geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
                                               wavelength=wavelength, pixel1=px_m, pixel2=px_m)
                     
