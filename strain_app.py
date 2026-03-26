@@ -39,8 +39,11 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
             dby_auto = y_min + np.argmax(v_gradient)
             
             # 찾은 지평선(Horizon) 위에서 가장 어두운 픽셀 찾기
+            # 그림자나 노이즈에 속지 않고 '거대한 덩어리(빔스탑)'의 정중앙을 찾기 위해 부드럽게 뭉갬
+            from scipy.ndimage import gaussian_filter1d
             h_profile = clipped[dby_auto, x_min:x_max]
-            dbx_auto = x_min + np.argmin(h_profile)
+            h_smooth = gaussian_filter1d(h_profile, sigma=5)
+            dbx_auto = x_min + np.argmin(h_smooth)
             
             return float(dbx_auto), float(dby_auto)
             
@@ -84,11 +87,11 @@ st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
 # [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
 if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
     if 'current_img' in st.session_state:
-        # 이미 세션 상태에 저장되어 있는 현재 (dbx, dby) 주변 ±100px 영역으로 국한하여 안전하고 정확하게 탐색
+        # 화면의 Number_input에 바로 입력된 최신값(dbx, dby) 주변 ±100px 영역으로 국한하여 탐색
         dbx_a, dby_a = auto_calibrate_center(
             st.session_state.current_img, 
-            base_x=st.session_state.dbx, 
-            base_y=st.session_state.dby, 
+            base_x=dbx, 
+            base_y=dby, 
             window=100
         )
         st.session_state.dbx = dbx_a
