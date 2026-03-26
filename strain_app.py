@@ -8,133 +8,123 @@ import pyFAI
 from pyFAI.azimuthalIntegrator import AzimuthalIntegrator
 from lmfit.models import GaussianModel
 import re
+import zipfile
+import io
 
-# --- 파일명에서 입사각 추출 (0.117d 패턴) ---
+# --- 헬퍼 함수 ---
 def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# --- 페이지 설정 ---
-st.set_page_config(page_title="UNIST 6D Strain Analyzer", layout="wide")
-st.title("🔬 6D 빔라인 Strain 분석 (Igor 매뉴얼 셋업 적용)")
+st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
+st.title("🔬 6D GIWAXS Strain 분석 (Manual p.7 왜곡 보정 적용)")
 
-# --- 사이드바: 빔 정보 설정 ---
-st.sidebar.header("1. 빔라인 세팅 (6D UNIST-PAL)")
-energy_kev = st.sidebar.number_input("Energy (keV)", value=12.4, help="보통 5~20 keV 사이를 사용합니다.")
-dist_mm = st.sidebar.number_input("Sample-to-Detector Distance (mm)", value=200.0)
-pixel_size_um = st.sidebar.number_input("Pixel Size (um)", value=172.0, help="검출기 픽셀 크기 (예: Pilatus=172, Rayonix=73.2)")
-center_x = st.sidebar.number_input("Beam Center X (pixel)", value=1024)
-center_y = st.sidebar.number_input("Beam Center Y (pixel)", value=512)
+# --- 사이드바: 기하학 설정 ---
+st.sidebar.header("1. Beamline Setup (Igor DB값)")
+energy_kev = st.sidebar.number_input("Energy (keV)", value=12.4, format="%.3f")
+dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f")
+pixel_um = st.sidebar.number_input("Pixel size (um)", value=172.0)
+# 매뉴얼 가이드: MATLAB Center에서 -1 한 값을 입력 [cite: 538]
+dbx = st.sidebar.number_input("DBx (Center X - 1)", value=1023.0)
+dby = st.sidebar.number_input("DBy (Center Y - 1)", value=511.0)
 
 # 물리량 계산
-wavelength = (12.3984 / energy_kev) * 1e-10 # 파장 (m)
+wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
-pixel_m = pixel_size_um * 1e-6
-poni1 = center_y * pixel_m # pyFAI 표준 좌표계
-poni2 = center_x * pixel_m
+px_m = pixel_um * 1e-6
 
 st.sidebar.divider()
-st.sidebar.header("🎯 Analysis Parameters")
+st.sidebar.header("2. Analysis Parameters")
 q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.542, format="%.4f")
-q_min = st.sidebar.number_input("Fitting Start q", value=1.4)
-q_max = st.sidebar.number_input("Fitting End q", value=1.7)
+# 고각 데이터 에러 방지를 위해 범위를 넉넉히 설정하세요
+q_min = st.sidebar.number_input("Fit Start q", value=1.4)
+q_max = st.sidebar.number_input("Fit End q", value=1.8)
 
-# --- 메인 로직 ---
-uploaded_files = st.sidebar.file_uploader("📂 TIF 데이터 임시 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+# --- 파일 업로드 및 데이터 관리 ---
+uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
 
 if uploaded_files:
-    st.subheader("📋 샘플 리스트 (자동 입사각 인식)")
-    
-    # 파일 이름 정보 추출
     file_list = sorted([f.name for f in uploaded_files])
+    # 세션 상태를 사용하여 결과 보존
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    if 'origin_zip' not in st.session_state:
+        st.session_state.origin_zip = None
+
     angles = [extract_incidence_angle(f) for f in file_list]
     input_df = pd.DataFrame({"파일명": file_list, "입사각(deg)": angles})
-    edited_df = st.data_editor(input_df, use_container_width=True)
+    edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor")
 
-    if st.button("🚀 Strain 분석 실행"):
-        # Streamlit 클라우드 환경에서는 fabio로 파일을 직접 열기 위해 임시 폴더에 바이트 정보를 저장합니다.
-        temp_dir = "temp_uploads"
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-            
-        saved_paths = {}
+    if st.button("🚀 전수 분석 실행", type="primary"):
+        temp_dir = "temp_data"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 1. 파일 선저장
+        saved_paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
         for uf in uploaded_files:
-            tmp_path = os.path.join(temp_dir, uf.name)
-            with open(tmp_path, "wb") as f:
+            with open(saved_paths[uf.name], "wb") as f:
                 f.write(uf.getbuffer())
-            saved_paths[uf.name] = tmp_path
 
-        # pyFAI 엔진 설정
-            geo = AzimuthalIntegrator(dist=dist_m, poni1=poni1, poni2=poni2, 
-                                      wavelength=wavelength, pixel1=pixel_m, pixel2=pixel_m)
-            
-            results = []
-            progress = st.progress(0)
-            
+        # 2. 분석 엔진 설정 (매뉴얼 p.7의 Ewald sphere 보정 반영)
+        geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
+                                  wavelength=wavelength, pixel1=px_m, pixel2=px_m)
+        
+        results = []
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            pbar = st.progress(0)
             for i, row in edited_df.iterrows():
                 try:
-                    f_path = saved_paths[row["파일명"]]
-                    img_data = fabio.open(f_path).data
+                    img = fabio.open(saved_paths[row["파일명"]]).data
+                    # 매뉴얼 7p [Iso q_xy cut] 로직: pyFAI는 적분 시 기하학적 왜곡을 자동 보정함 [cite: 790]
+                    q, I = geo.integrate1d(img, 1000, unit="q_A^-1")
                     
-                    # 1D Integration (Line-cut 대체) 
-                    q, I = geo.integrate1d(img_data, 1000, unit="q_A^-1")
-                    
-                    # Peak Fitting
+                    # Origin 데이터 생성
+                    txt = pd.DataFrame({"q": q, "I": I}).to_csv(sep='\t', index=False)
+                    zip_file.writestr(f"{row['파일명']}_origin.txt", txt)
+
+                    # Fitting
                     mask = (q >= q_min) & (q <= q_max)
-                    q_cut, I_cut = q[mask], I[mask]
+                    q_c, I_c = q[mask], I[mask]
                     
-                    if len(q_cut) == 0:
-                        raise ValueError(f"설정하신 Fitting 범위(q={q_min}~{q_max}) 내에 데이터가 하나도 없습니다! (현재 계산된 전체 이미지의 최대 q값은 {q.max():.4f} 입니다). SDD나 Pixel Size 등 Setup 수치를 다시 확인해 주세요.")
-                    
+                    if len(q_c) < 5: 
+                        raise ValueError("Fitting 영역에 데이터 부족. q 범위를 넓혀보세요.")
+                        
                     model = GaussianModel()
-                    params = model.guess(I_cut, x=q_cut)
-                    out = model.fit(I_cut, params, x=q_cut)
+                    out = model.fit(I_c, model.guess(I_c, x=q_c), x=q_c)
                     q_exp = out.params['center'].value
-                    
-                    # Strain 공식 적용
-                    strain = (q_bulk - q_exp) / q_exp
                     
                     results.append({
                         "파일명": row["파일명"],
                         "입사각": row["입사각(deg)"],
                         "q_measured": q_exp,
-                        "Strain(%)": strain * 100
+                        "Strain(%)": (q_bulk - q_exp) / q_exp * 100
                     })
-                    
-                    # 상세 결과 시각화 (Igor jet 스타일 적용) 
-                    with st.expander(f"📊 {row['파일명']} 분석 상세"):
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            fig2d, ax2d = plt.subplots()
-                            # 매뉴얼의 Rainbow/Reverse 컬러맵 적용 [cite: 695]
-                            im = ax2d.imshow(np.log1p(np.clip(img_data, 0, None)), cmap='jet', origin='lower')
-                            ax2d.set_title("2D GIWAXS (Jet Colormap)")
-                            plt.colorbar(im, ax=ax2d)
-                            st.pyplot(fig2d)
-                        with c2:
-                            fig1d, ax1d = plt.subplots()
-                            ax1d.plot(q_cut, I_cut, 'bo', label='Data')
-                            ax1d.plot(q_cut, out.best_fit, 'r-', label='Fit')
-                            ax1d.axvline(q_exp, color='g', linestyle='--', label=f'q={q_exp:.4f}')
-                            ax1d.set_title("Peak Fitting Result")
-                            ax1d.set_xlabel("q (Å⁻¹)")
-                            ax1d.legend()
-                            st.pyplot(fig1d)
-                            
                 except Exception as e:
-                    st.error(f"Error in {row['파일명']}: {e}")
-                progress.progress((i + 1) / len(edited_df))
+                    st.error(f"❌ {row['파일명']} 실패: {e}")
+                pbar.progress((i + 1) / len(edited_df))
+        
+        st.session_state.analysis_results = pd.DataFrame(results)
+        st.session_state.origin_zip = zip_buffer.getvalue()
 
-            # 최종 트렌드 보고
-            if results:
-                res_df = pd.DataFrame(results)
-                st.divider()
-                st.subheader("📈 입사각별 Strain 트렌드")
-                fig_res, ax_res = plt.subplots(figsize=(8, 5))
-                ax_res.plot(res_df["입사각"], res_df["Strain(%)"], 'bo-', linewidth=2)
-                ax_res.set_xlabel("Incidence Angle (deg)")
-                ax_res.set_ylabel("Strain (%)")
-                ax_res.grid(True, alpha=0.3)
-                st.pyplot(fig_res)
-                
-                st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="download_csv_results")
+    # --- 결과 출력 (세션 데이터 기반) ---
+    if st.session_state.analysis_results is not None:
+        res_df = st.session_state.analysis_results
+        st.divider()
+        st.subheader("📊 분석 결과 요약")
+        st.dataframe(res_df.style.format({"Strain(%)": "{:.3f}"}))
+        
+        # 중복 Key 방지를 위해 고유 ID 부여
+        st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), 
+                           "strain_summary.csv", key="csv_download_btn")
+        st.download_button("📂 Origin용 TXT(.zip) 저장", st.session_state.origin_zip, 
+                           "origin_data.zip", key="zip_download_btn")
+
+        # 트렌드 그래프
+        fig, ax = plt.subplots()
+        ax.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-', label='Strain Trend')
+        ax.set_xlabel("Incidence Angle (deg)")
+        ax.set_ylabel("Strain (%)")
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
