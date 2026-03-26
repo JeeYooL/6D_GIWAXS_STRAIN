@@ -138,9 +138,8 @@ mask_bg = st.sidebar.checkbox("상반원 배경 지우기 (Intensity ≤ 5)", va
 st.sidebar.divider()
 st.sidebar.header("2. 분석 파라미터")
 q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format="%.4f")
-q_min = st.sidebar.number_input("피크 탐색 시작 q", value=1.20, help="피크를 자동 탐색할 q 범위의 시작점 (Fitting 범위 아님)")
-q_max = st.sidebar.number_input("피크 탐색 끝 q", value=1.70, help="피크를 자동 탐색할 q 범위의 끝점 (Fitting 범위 아님)")
-fwhm_mult = st.sidebar.number_input("Fitting window (×FWHM)", value=3.0, min_value=1.5, max_value=6.0, step=0.5, help="Target peak의 FWHM × 이 값 = 실제 fitting 범위. 클수록 넓게 피팅.")
+q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.30)
+q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.65)
 
 st.sidebar.subheader("🎯 1D 적분 각도 (Out / In-plane)")
 c_out1, c_out2 = st.sidebar.columns(2)
@@ -251,122 +250,73 @@ if uploaded_files:
                     txt = pd.DataFrame({"q_out": q_out, "I_out": I_out, "q_in": q_in, "I_in": I_in}).to_csv(sep='\t', index=False)
                     zip_file.writestr(f"{row['파일명']}_1D.txt", txt)
 
-                    # --- [Peak-Centric Adaptive Pseudo-Voigt Fitting Engine] ---
+                    # --- [Multi-Peak Pseudo-Voigt Fitting] ---
                     def fit_peak(q, I):
-                        from scipy.signal import find_peaks, peak_widths
+                        from scipy.signal import find_peaks
                         
-                        # ===== STEP 1: 탐색 범위에서 모든 피크 자동 감지 =====
-                        search_mask = (q >= q_min) & (q <= q_max)
-                        q_search, I_search = q[search_mask], I[search_mask]
-                        if len(q_search) < 10: return None, None, None, None, {}
+                        # 사용자가 지정한 q 범위에서 직접 피팅 (안정적)
+                        mask = (q >= q_min) & (q <= q_max)
+                        qc, Ic = q[mask], I[mask]
+                        if len(qc) < 5: return None, None, None, None, {}
                         
-                        peaks, props = find_peaks(I_search, 
-                                                   prominence=0.05 * (I_search.max() - I_search.min()), 
-                                                   distance=5, width=2)
-                        
+                        # 1. 피크 자동 감지
+                        peaks, _ = find_peaks(Ic, prominence=0.03 * (Ic.max() - Ic.min()), distance=5)
                         if len(peaks) == 0:
-                            peaks = np.array([np.argmax(I_search)])
+                            peaks = [np.argmax(Ic)]
                         
-                        # ===== STEP 2: q_bulk에 가장 가까운 target peak 선정 =====
-                        peak_q_vals = q_search[peaks]
-                        target_idx = np.argmin(np.abs(peak_q_vals - q_bulk))
-                        target_q = peak_q_vals[target_idx]
-                        target_peak_idx = peaks[target_idx]
+                        # 2. Linear 배경 + Multi-peak Pseudo-Voigt 모델
+                        model = LinearModel(prefix='bkg_')
+                        params = model.make_params(slope=0, intercept=Ic.min())
                         
-                        # ===== STEP 3: FWHM 기반 adaptive fitting window =====
-                        # 피크의 half-max 폭 추정
-                        try:
-                            widths_result = peak_widths(I_search, [target_peak_idx], rel_height=0.5)
-                            fwhm_pts = widths_result[0][0]  # FWHM in data points
-                            dq = np.mean(np.diff(q_search))  # q spacing
-                            fwhm_q = fwhm_pts * dq
-                        except:
-                            fwhm_q = 0.03  # 기본값
-                        
-                        # Adaptive window: target peak 중심 ± (FWHM × multiplier)
-                        fit_half_width = max(fwhm_q * fwhm_mult, 0.04)  # 최소 ±0.04
-                        fit_q_min = target_q - fit_half_width
-                        fit_q_max = target_q + fit_half_width
-                        
-                        fit_mask = (q >= fit_q_min) & (q <= fit_q_max)
-                        qc, Ic = q[fit_mask], I[fit_mask]
-                        if len(qc) < 8: return None, None, None, None, {}
-                        
-                        # ===== STEP 4: Polynomial baseline 추정 및 제거 =====
-                        # fitting window 양 끝 10%의 점들로 baseline 추정
-                        n_edge = max(3, len(qc) // 10)
-                        edge_q = np.concatenate([qc[:n_edge], qc[-n_edge:]])
-                        edge_I = np.concatenate([Ic[:n_edge], Ic[-n_edge:]])
-                        baseline_coeffs = np.polyfit(edge_q, edge_I, 2)
-                        baseline = np.polyval(baseline_coeffs, qc)
-                        
-                        # ===== STEP 5: Window 내 피크 재감지 + Multi-peak Pseudo-Voigt =====
-                        Ic_sub = Ic - baseline  # baseline 제거된 데이터
-                        Ic_sub = np.maximum(Ic_sub, 0)  # 음수 방지
-                        
-                        local_peaks, _ = find_peaks(Ic_sub, 
-                                                     prominence=0.03 * (Ic_sub.max() - Ic_sub.min() + 1),
-                                                     distance=3)
-                        if len(local_peaks) == 0:
-                            local_peaks = np.array([np.argmax(Ic_sub)])
-                        
-                        # Pseudo-Voigt multi-peak model
-                        model = PolynomialModel(degree=2, prefix='bkg_')  # 2차 다항 배경
-                        params = model.make_params(c0=baseline_coeffs[2], c1=baseline_coeffs[1], c2=baseline_coeffs[0])
-                        
-                        for i, p_idx in enumerate(local_peaks):
+                        for i, p_idx in enumerate(peaks):
                             center_guess = qc[p_idx]
-                            amp_guess = max(Ic_sub[p_idx] * 0.05, 1.0)
+                            amp_guess = (Ic[p_idx] - Ic.min()) * 0.05
                             
                             p_model = PseudoVoigtModel(prefix=f'p{i}_')
                             p_params = p_model.make_params(
-                                amplitude=amp_guess, 
-                                center=center_guess, 
-                                sigma=fwhm_q / 2.355,  # FWHM → sigma 변환
-                                fraction=0.5  # Lorentzian 비율 초기값 50%
+                                amplitude=max(amp_guess, 1.0),
+                                center=center_guess,
+                                sigma=0.02,
+                                fraction=0.5
                             )
-                            p_params[f'p{i}_center'].set(min=center_guess - 0.03, max=center_guess + 0.03)
+                            p_params[f'p{i}_center'].set(min=center_guess - 0.05, max=center_guess + 0.05)
                             p_params[f'p{i}_sigma'].set(min=0.002, max=0.1)
                             p_params[f'p{i}_fraction'].set(min=0, max=1)
                             
                             model += p_model
                             params.update(p_params)
                         
-                        # ===== STEP 6: 피팅 수행 =====
+                        # 3. 피팅 수행
                         out = model.fit(Ic, params, x=qc)
                         
-                        # ===== STEP 7: Target peak 선택 (q_bulk에 가장 가까운 amplitude 최대) =====
+                        # 4. q_bulk 근방(±0.15) 중 amplitude 최대 피크 선택
                         candidates = []
-                        for j in range(len(local_peaks)):
+                        for j in range(len(peaks)):
                             c_val = out.params[f'p{j}_center'].value
                             a_val = out.params[f'p{j}_amplitude'].value
-                            if abs(c_val - q_bulk) < fit_half_width:
+                            if abs(c_val - q_bulk) < 0.15:
                                 candidates.append((c_val, a_val, j))
                         
                         if candidates:
                             best = max(candidates, key=lambda x: x[1])
-                            best_center = best[0]
-                            best_idx = best[2]
+                            best_center, best_idx = best[0], best[2]
                         else:
-                            best_center = target_q
+                            centers = [out.params[f'p{j}_center'].value for j in range(len(peaks))]
+                            best_center = min(centers, key=lambda c: abs(c - q_bulk))
                             best_idx = 0
                         
-                        # ===== STEP 8: Strain 계산 + 진단 지표 =====
-                        strain = (q_bulk - best_center) / q_bulk * 100  # q_bulk 기준 정규화
+                        # 5. Strain 계산 + 진단
+                        strain = (q_bulk - best_center) / q_bulk * 100
                         
-                        # 진단 지표
                         sigma_fit = out.params[f'p{best_idx}_sigma'].value
-                        fwhm_fit = sigma_fit * 2.355  # Gaussian FWHM 근사
+                        fwhm_fit = sigma_fit * 2.355
                         ss_res = np.sum((Ic - out.best_fit) ** 2)
                         ss_tot = np.sum((Ic - np.mean(Ic)) ** 2)
                         r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
                         
                         diagnostics = {
-                            'center': best_center,
-                            'fwhm': fwhm_fit,
-                            'r_squared': r_squared,
-                            'fit_range': (fit_q_min, fit_q_max),
-                            'n_peaks': len(local_peaks)
+                            'center': best_center, 'fwhm': fwhm_fit,
+                            'r_squared': r_squared, 'n_peaks': len(peaks)
                         }
                         
                         return qc, Ic, out, strain, diagnostics
