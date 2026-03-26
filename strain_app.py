@@ -54,6 +54,13 @@ q_max = st.sidebar.number_input("Fit 영역 끝 q", value=2.0)
 # 굴절 보정을 위한 임계각 (예: 페로브스카이트 ~0.14)
 critical_angle = st.sidebar.number_input("물질 Critical Angle (deg)", value=0.14, format="%.3f")
 
+st.sidebar.divider()
+st.sidebar.subheader("🎯 1D 적분(Integration) 각도 설정")
+use_azimuth_cut = st.sidebar.checkbox("✅ 특정 범위(윗반원 등)만 잘라서 분석하기", value=True, help="체크 시 아래반원 등 불필요한 노이즈를 제외할 수 있습니다.")
+ca1, ca2 = st.sidebar.columns(2)
+azi_min = ca1.number_input("최소 Azimuth (°)", value=-90)
+azi_max = ca2.number_input("최대 Azimuth (°)", value=90)
+
 # --- 파일 업로드 영역 ---
 st.sidebar.subheader("📂 데이터 업로드 방식")
 use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
@@ -108,9 +115,11 @@ if uploaded_files:
                     f_full_path = paths[row["파일명"]]
                     img = fabio.open(f_full_path).data
                     
-                    # [개선] Vertical 방향 섹터 적분 (예: 90도 근처 +-10도)
-                    # out-of-plane Strain 분석을 위한 날카로운 피크 확보
-                    q, I = geo.integrate1d(img, 1000, unit="q_A^-1", azimuth_range=(80, 100))
+                    # 사용자의 선택에 따른 방위각(Azimuth) 범위 제한 (기본: 윗반원)
+                    if use_azimuth_cut:
+                        q, I = geo.integrate1d(img, 1000, unit="q_A^-1", azimuth_range=(azi_min, azi_max))
+                    else:
+                        q, I = geo.integrate1d(img, 1000, unit="q_A^-1")
                     
                     # Origin 데이터 저장
                     txt_data = pd.DataFrame({"q": q, "I": I}).to_csv(sep='\t', index=False)
