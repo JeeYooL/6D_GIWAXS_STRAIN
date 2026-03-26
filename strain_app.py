@@ -19,75 +19,73 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [NEW] 급격한 강도 변화(Edge Boundary)의 중간점을 원점으로 인식하는 미세조정 로직
+# [NEW] 회절 링(Ring) 기반 Azimuthal Variance Minimization 원점 탐색
 def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
+    """
+    회절 링의 azimuthal intensity variance를 최소화하는 (cx, cy)를 탐색.
+    정확한 중심에서는 링 위의 밝기가 균일(variance↓), 빗나가면 불균일(variance↑).
+    """
     try:
         import numpy as np
-        from scipy.ndimage import gaussian_filter1d, gaussian_filter
+        from scipy.optimize import minimize
+        from scipy.ndimage import gaussian_filter
         
         h, w = img_data.shape
         p99 = np.percentile(img_data, 99.5)
-        clipped = np.clip(img_data, 0, p99)
+        img_smooth = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=3)
         
-        # 연구원님의 핵심 아이디어: 강도(Intensity)에 로그를 씌워 변화(6 과 4의 차이 등)를 명확히 함
-        log_img = np.log1p(clipped)
-        
-        if base_x is not None and base_y is not None:
-            # --- 1. 위아래(Y축) 경계값 중심 인식 ---
-            # DBx를 기준으로 위아래 ±window 만큼의 밝기 프로파일 읽기
-            y_start = max(0, int(base_y - window))
-            y_end = min(h, int(base_y + window))
-            x_target = int(base_x)
-            
-            # 1픽셀 너비로는 노이즈가 있을 수 있으니 x근방 5픽셀 두께 평균을 읽음 (더욱 강건함)
-            x_min_slice = max(0, x_target - 2)
-            x_max_slice = min(w, x_target + 3)
-            v_profile = np.mean(log_img[y_start:y_end, x_min_slice:x_max_slice], axis=1)
-            
-            # 1단위 노이즈 방어를 위한 부드러운 스무딩
-            v_smooth = gaussian_filter1d(v_profile, sigma=3)
-            
-            # 연구원님 아이디어 구현: 6과 4 같이 "큰 차이가 나는 지점(급격한 변화량)" 추출
-            v_diff = np.diff(v_smooth)
-            
-            # 밝다->어둡다 (급격한 추락: 음의 최대 변화량) = 빔스탑 상단 경계
-            # 어둡다->밝다 (급격한 상승: 양의 최대 변화량) = 빔스탑 하단 경계
-            edge_top = np.argmin(v_diff)
-            edge_bottom = np.argmax(v_diff)
-            
-            # 두 경계값(큰 차이가 나는 두 지점)의 정확한 사이지점(Midpoint)을 DBy로 인식
-            dby_auto = y_start + (edge_top + edge_bottom) / 2.0
-            
-            # --- 2. 좌우(X축) 경계값 중심 인식 ---
-            # 찾아낸 DBy_auto를 기준으로 좌우 ±window 만큼 읽기
-            x_start = max(0, int(base_x - window))
-            x_end = min(w, int(base_x + window))
-            y_target = int(dby_auto)
-            
-            y_min_slice = max(0, y_target - 2)
-            y_max_slice = min(h, y_target + 3)
-            h_profile = np.mean(log_img[y_min_slice:y_max_slice, x_start:x_end], axis=0)
-            
-            h_smooth = gaussian_filter1d(h_profile, sigma=3)
-            h_diff = np.diff(h_smooth)
-            
-            # 좌측 경계(추락), 우측 경계(상승)
-            edge_left = np.argmin(h_diff)
-            edge_right = np.argmax(h_diff)
-            
-            # 두 좌우 지점의 사이를 DBx로 인식
-            dbx_auto = x_start + (edge_left + edge_right) / 2.0
-            
-            return float(dbx_auto), float(dby_auto)
-            
-        else:
-            # 전체 1단계 탐색의 경우 빔스탑 전체를 뭉개버리는(Blur) 기존 덩어리 탐색 사용
+        if base_x is None or base_y is None:
+            # 전역 초기 탐색: 가우시안 블러 최소값
             margin_x, margin_y = int(w * 0.20), int(h * 0.10)
-            safe_region = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
-            smoothed_safe = gaussian_filter(safe_region, sigma=25)
-            dy, dx = np.unravel_index(np.argmin(smoothed_safe), smoothed_safe.shape)
-            return float(margin_x + dx), float(margin_y + dy)
-            
+            safe = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=25)
+            safe_region = safe[margin_y:h-margin_y, margin_x:w-margin_x]
+            dy, dx = np.unravel_index(np.argmin(safe_region), safe_region.shape)
+            base_x, base_y = float(margin_x + dx), float(margin_y + dy)
+        
+        # --- 회절 링 기반 원점 최적화 ---
+        # 하반원(빔 아래쪽)에서만 샘플링: 각도 범위 200°~340° (약 -160°~ -20°, 즉 아래쪽 반원)
+        # GIWAXS 상반원은 데이터가 없으므로 제외
+        n_angles = 72  # 5° 간격
+        angles = np.linspace(np.radians(200), np.radians(340), n_angles)
+        
+        # 사용할 반지름: 빔스탑을 넘어서 링이 존재하는 영역
+        radii = np.arange(150, 650, 50)  # 150~600px, 50px 간격
+        
+        def azimuthal_cost(center):
+            cx, cy = center
+            total_var = 0.0
+            n_valid = 0
+            for r in radii:
+                intensities = []
+                for theta in angles:
+                    px = int(cx + r * np.cos(theta))
+                    py = int(cy + r * np.sin(theta))
+                    if 0 <= px < w and 0 <= py < h:
+                        val = img_smooth[py, px]
+                        if val > 0:  # 마스크/빔스탑 영역(0 또는 매우 작은 값) 제외
+                            intensities.append(val)
+                if len(intensities) > n_angles // 3:  # 최소 1/3 이상의 유효 데이터가 있어야 분산 계산
+                    arr = np.array(intensities)
+                    # 정규화된 분산 (스케일 독립적)
+                    mean_val = arr.mean()
+                    if mean_val > 0:
+                        total_var += arr.std() / mean_val
+                        n_valid += 1
+            return total_var / max(n_valid, 1)
+        
+        # Nelder-Mead 최적화 (초기값 ±30px 범위 내에서 탐색)
+        x0 = [base_x, base_y]
+        result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
+                          options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
+        
+        opt_x, opt_y = result.x
+        
+        # 결과가 초기값에서 너무 벗어나면 (>30px) 초기값을 유지 (안전장치)
+        if abs(opt_x - base_x) > 30 or abs(opt_y - base_y) > 30:
+            return float(base_x), float(base_y)
+        
+        return float(opt_x), float(opt_y)
+        
     except Exception:
         if base_x is not None and base_y is not None: return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
