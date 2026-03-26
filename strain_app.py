@@ -16,19 +16,36 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [추가] 지평선 및 빔스탑 기반 2단계 자동 정렬 알고리즘
+# [강화된 2단계 자동 정렬 알고리즘] Difference of Gaussians (DoG) 기반 빔스탑 탐지
 def auto_calibrate_center(img_data):
-    # Step 1: DBy 찾기 (수직 그라디언트 최대 지점 = Horizon)
-    # axis=1로 합산하여 각 행의 전체 강도 변화를 관찰
-    v_profile = np.sum(img_data, axis=1)
-    v_gradient = np.abs(np.diff(v_profile))
-    dby_auto = np.argmax(v_gradient) # 지평선(Horizon) 행 번호
-    
-    # Step 2: DBx 찾기 (검출된 지평선상에서 가장 어두운 지점 = Beamstop)
-    h_profile = img_data[dby_auto, :]
-    dbx_auto = np.argmin(h_profile) # 빔스탑 중심 열 번호
-    
-    return float(dbx_auto), float(dby_auto)
+    try:
+        import scipy.ndimage as ndi
+        
+        # 1. 핫픽셀 및 우측 하단 에러 픽셀(빨간 네모) 등 극단적인 노이즈 자르기
+        p99 = np.percentile(img_data, 99.5)
+        clipped = np.clip(img_data, 0, p99)
+        
+        # 2. DoG 필터 (Mexican Hat) 적용
+        # 빔스탑(어두운 원)과 할로(밝은 회절 링)의 극적인 대비를 이용
+        # sigma=50은 주변 밝기를 넓게 평균내고, sigma=10은 빔스탑의 날카로운 윤곽을 잡음
+        blur_large = ndi.gaussian_filter(clipped, sigma=50)
+        blur_small = ndi.gaussian_filter(clipped, sigma=10)
+        
+        dog = blur_large - blur_small
+        
+        # 3. 가장 완벽한 둥근 얼룩(Blob)의 중심 좌표 찾기
+        # 빔스탑에 가려져 중심이 어두우면 dog가 크게 양수(+)
+        # 만약 마스킹 없이 빔이 직접 때려 포화된 경우 dog가 크게 음수(-)
+        if abs(np.min(dog)) > abs(np.max(dog)):
+            dby_auto, dbx_auto = np.unravel_index(np.argmin(dog), dog.shape)
+        else:
+            dby_auto, dbx_auto = np.unravel_index(np.argmax(dog), dog.shape)
+            
+        return float(dbx_auto), float(dby_auto)
+    except ImportError:
+        # scipy가 없을 경우를 대비한 단순 Fallback
+        dby_auto, dbx_auto = np.unravel_index(np.argmin(img_data), img_data.shape)
+        return float(dbx_auto), float(dby_auto)
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
 st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
@@ -71,9 +88,14 @@ q_bulk = st.sidebar.number_input("Bulk q-value (Å⁻¹)", value=1.5420, format=
 q_min = st.sidebar.number_input("Fit 영역 시작 q", value=1.40)
 q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.80)
 
-st.sidebar.subheader("🎯 1D 적분 각도 설정")
-azi_min = st.sidebar.number_input("최소 Azimuth (°)", value=-180)
-azi_max = st.sidebar.number_input("최대 Azimuth (°)", value=0)
+st.sidebar.subheader("🎯 1D 적분 각도 (Out / In-plane)")
+c_out1, c_out2 = st.sidebar.columns(2)
+azi_out_min = c_out1.number_input("Out 최소(°)", value=-110)
+azi_out_max = c_out2.number_input("Out 최대(°)", value=-70)
+
+c_in1, c_in2 = st.sidebar.columns(2)
+azi_in_min = c_in1.number_input("In 최소(°)", value=-20)
+azi_in_max = c_in2.number_input("In 최대(°)", value=0)
 
 # --- 파일 업로드 방식 결정 ---
 st.sidebar.subheader("📂 데이터 업로드 방식")
@@ -149,42 +171,71 @@ if uploaded_files:
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
-                    q, I = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_min, azi_max))
+                    q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
+                    q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
                     
-                    # Origin 저장
-                    txt = pd.DataFrame({"q": q, "I": I}).to_csv(sep='\t', index=False)
+                    # Origin 저장 (두 방향 통합)
+                    txt = pd.DataFrame({"q_out": q_out, "I_out": I_out, "q_in": q_in, "I_in": I_in}).to_csv(sep='\t', index=False)
                     zip_file.writestr(f"{row['파일명']}_1D.txt", txt)
 
-                    # 피팅
-                    mask = (q >= q_min) & (q <= q_max)
-                    qc, Ic = q[mask], I[mask]
-                    if len(qc) < 5: continue
+                    # --- 피팅 함수 정의 ---
+                    def fit_peak(q, I):
+                        mask = (q >= q_min) & (q <= q_max)
+                        qc, Ic = q[mask], I[mask]
+                        if len(qc) < 5: return None, None, None, None
                         
-                    model = GaussianModel() + LinearModel()
-                    params = model.make_params(amplitude=Ic.max()-Ic.min(), center=(q_min+q_max)/2, sigma=0.05, slope=0, intercept=Ic.min())
-                    params['center'].set(min=q_min, max=q_max)
-                    out = model.fit(Ic, params, x=qc)
-                    q_exp = out.params['center'].value
-                    strain = (q_bulk - q_exp) / q_exp * 100
+                        model = GaussianModel() + LinearModel()
+                        params = model.make_params(amplitude=Ic.max()-Ic.min(), center=(q_min+q_max)/2, sigma=0.05, slope=0, intercept=Ic.min())
+                        params['center'].set(min=q_min, max=q_max)
+                        out = model.fit(Ic, params, x=qc)
+                        q_exp = out.params['center'].value
+                        strain = (q_bulk - q_exp) / q_exp * 100
+                        return qc, Ic, out, strain
+
+                    # 두 방향 각각 피팅
+                    qc_out, Ic_out, fit_out, strain_out = fit_peak(q_out, I_out)
+                    qc_in, Ic_in, fit_in, strain_in = fit_peak(q_in, I_in)
                     
-                    results.append({"파일명": row["파일명"], "입사각": row["입사각(deg)"], "q_measured": q_exp, "Strain(%)": strain})
+                    if fit_out is None or fit_in is None:
+                        st.warning(f"{row['파일명']}: 피팅할 데이터가 부족합니다.")
+                        continue
+                        
+                    results.append({"파일명": row["파일명"], "입사각": row["입사각(deg)"], 
+                                    "Strain_Out(%)": strain_out, "Strain_In(%)": strain_in})
                     
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2 = st.columns(2)
                         with c1:
-                            # [논문 표기법 적용] q_xy, q_z 축 변환 및 시각화
+                            # 2D GIWAXS 패턴
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
                             ext = [-dbx*dq, (w-dbx)*dq, -dby*dq, (h-dby)*dq]
                             fig2d, ax2d = plt.subplots()
                             ax2d.imshow(np.log1p(np.clip(np.flipud(img_data), 0, None)), cmap='jet', extent=ext)
-                            ax2d.set_title("2D GIWAXS (Automated Alignment)"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
+                            ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
-                            fig1d, ax1d = plt.subplots()
-                            ax1d.plot(qc, Ic, 'bo', markersize=3, label='Data')
-                            ax1d.plot(qc, out.best_fit, 'r-', label='Fit')
-                            ax1d.set_title(f"Strain: {strain:.3f}%"); ax1d.legend(); st.pyplot(fig1d); plt.close(fig1d)
+                            # 1D 피팅 결과 (Out: Blue, In: Red 이중 축)
+                            fig1d, ax_out = plt.subplots()
+                            
+                            ax_out.plot(qc_out, Ic_out, 'bo', markersize=3, label='Out Data')
+                            ax_out.plot(qc_out, fit_out.best_fit, 'b-', label='Out Fit')
+                            ax_out.set_ylabel("Intensity (Out)", color='b')
+                            ax_out.tick_params(axis='y', labelcolor='b')
+                            
+                            ax_in = ax_out.twinx()
+                            ax_in.plot(qc_in, Ic_in, 'ro', markersize=3, label='In Data')
+                            ax_in.plot(qc_in, fit_in.best_fit, 'r-', label='In Fit')
+                            ax_in.set_ylabel("Intensity (In)", color='r')
+                            ax_in.tick_params(axis='y', labelcolor='r')
+                            
+                            ax_out.set_title(f"Out: {strain_out:.3f}% | In: {strain_in:.3f}%")
+                            
+                            lines1, labels1 = ax_out.get_legend_handles_labels()
+                            lines2, labels2 = ax_in.get_legend_handles_labels()
+                            ax_out.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+                            
+                            st.pyplot(fig1d); plt.close(fig1d)
                             
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
@@ -200,10 +251,15 @@ if uploaded_files:
         else:
             c1, c2 = st.columns([1, 1.5])
             with c1:
-                st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
+                st.dataframe(res_df.style.format({"Strain_Out(%)": "{:.3f}", "Strain_In(%)": "{:.3f}"}))
                 st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv_auto")
             with c2:
                 fig_tr, ax_tr = plt.subplots()
-                ax_tr.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-'); ax_tr.set_xlabel("Incidence Angle (deg)"); ax_tr.set_ylabel("Strain (%)")
+                ax_tr.plot(res_df["입사각"], res_df["Strain_Out(%)"], 'bo-', label="Out-of-plane")
+                ax_tr.plot(res_df["입사각"], res_df["Strain_In(%)"], 'ro-', label="In-plane")
+                ax_tr.set_xlabel("Incidence Angle (deg)")
+                ax_tr.set_ylabel("Strain (%)")
+                ax_tr.legend()
+                ax_tr.grid(True, linestyle='--', alpha=0.7)
                 st.pyplot(fig_tr)
                 plt.close(fig_tr)
