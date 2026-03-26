@@ -16,64 +16,73 @@ def extract_incidence_angle(filename):
     match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [NEW] 원형 허프 변환(Circle Hough Transform) 기반 자동 빔 센터 탐지
+# [NEW] 대칭성 극대화(Phase Cross-Correlation) 기반 자동 빔 센터 탐지
 def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     try:
-        from skimage import feature, transform
-        from skimage.filters import gaussian
         import numpy as np
+        from skimage import filters, registration, transform
         
         h, w = img_data.shape
         
-        # 1. 아티팩트 및 컬러바 방지를 위한 전역 마스킹 공간 (극단 가장자리 배제)
-        # 연구원님의 팁(ROI 설정) 완벽 반영
-        margin_x = int(w * 0.10)
-        margin_y = int(h * 0.10)
+        # 1. 아티팩트 및 컬러바 방지를 위한 전역 마스킹 (연구원님 팁 강력 반영)
+        # 안전한 슬라이싱을 위해 좌우 10%, 상하 5% 정도 마진을 자름
+        margin_x = int(w * 0.15)
+        margin_y = int(h * 0.15)
         
+        # 2. X선 데이터 처리: 노이즈 자르기, 로그 스케일링, 블러
+        p99 = np.percentile(img_data, 99.5)
+        clipped = np.clip(img_data, 0, p99)
+        
+        # 중심부 실제 데이터 영역만 슬라이싱 (텍스트, 컬러바 완전 제외)
+        raw_data = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
+        
+        # 로그 스케일링: 강도 차이를 줄여 회절 링 구조 부각
+        processed_data = np.log1p(raw_data)
+        
+        # 가우시안 블러링: 미세 노이즈 제거
+        processed_data = filters.gaussian(processed_data, sigma=3)
+        
+        # 3. 초기 중심 추정 (간단하게 중심 좌표 사용 혹은 수동 입력값 연동)
+        ph, pw = processed_data.shape
         if base_x is not None and base_y is not None:
-            # 동적/미세조정 추적 모드: 수동 입력 근방을 넓게(window*3=300px 이상) 잡아서 휘어진 링의 온전한 호(Arc)를 파악
-            roi_radius = max(int(window * 3), 500)
-            x_min = max(margin_x, int(base_x - roi_radius))
-            x_max = min(w - margin_x, int(base_x + roi_radius))
-            y_min = max(margin_y, int(base_y - roi_radius))
-            y_max = min(h - margin_y, int(base_y + roi_radius))
+            # 원본 좌표계(base_x)에서 슬라이싱된 마진만큼 오프셋 적용
+            initial_cx = base_x - margin_x
+            initial_cy = base_y - margin_y
         else:
-            # 전체 초기 탐색(Global Search) 모드: 중앙 80% 영역에서 원형 링을 집중 탐색
-            x_min, x_max = margin_x, w - margin_x
-            y_min, y_max = margin_y, h - margin_y
+            initial_cx, initial_cy = pw // 2, ph // 2
             
-        roi_img = img_data[y_min:y_max, x_min:x_max]
-        
-        # 2. X선 데이터의 넓은 강도를 압축: 로그 스케일링 (흐릿한 외곽 링 가시성 폭발적 향상)
-        p99 = np.percentile(roi_img, 99.5)
-        clipped_roi = np.clip(roi_img, 0, p99)
-        log_img = np.log1p(clipped_roi)
-        
-        # 3. 전처리: Canny 엣지 검출을 극대화하기 위한 가우시안 노이즈 제거
-        blurred_img = gaussian(log_img, sigma=2)
-        
-        # 4. Canny 엣지 검출 (산란 링 테두리 찾기)
-        edges = feature.canny(blurred_img, sigma=3, low_threshold=0.1, high_threshold=0.2)
-        
-        # 5. 허프 변환(Hough Transform) 원 중심 찾기
-        # 반지름 탐색 범위를 넓게 조정 (GIWAXS 특성상 링 크기가 다양함)
-        hough_radii = np.arange(100, min(roi_img.shape)//2, 50)
-        hough_res = transform.hough_circle(edges, hough_radii)
-        
-        # 가장 강력한 링 곡률 모델(total_num_peaks=1) 1개의 중심(기하학적 Origin) 추출
-        accums, cx, cy, radii = transform.hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
-        
-        if len(cx) > 0:
-            # ROI 기준(cx, cy) 좌표를 전체 원본 해상도(x_min, y_min 오프셋) 절대 좌표계로 변환
-            final_x = float(x_min + cx[0])
-            final_y = float(y_min + cy[0])
-            return final_x, final_y
-        else:
-            # 희박한 확률로 원을 못 찾았을 경우 Fallback 호출
-            raise ValueError("허프 변환으로 기하학적 산란 링(Circle)을 찾지 못했습니다.")
+        def optimize_center(img, cx, cy):
+            """이미지를 180도 회전시킨 후, 원본과 가장 잘 일치하는 평행 이동 값을 찾습니다."""
+            img_orig = img.copy()
+            # 180도 회전된 이미지
+            img_rot = transform.rotate(img, 180, center=(cx, cy), preserve_range=True)
             
+            # 대칭성을 이용하여 미세 이동량 계산 (sub-pixel 정밀도)
+            result = registration.phase_cross_correlation(img_orig, img_rot, upsample_factor=10)
+            
+            # 구버전/신버전 호환용 튜플 체크
+            detected_shift = result[0] if isinstance(result, tuple) else result
+            
+            # 이동량의 절반만큼 보정
+            refined_cx = cx - detected_shift[1] / 2.0
+            refined_cy = cy - detected_shift[0] / 2.0
+            return float(refined_cx), float(refined_cy)
+
+        # (1단계) 초기 중심에서 탐색 시작
+        intermediate_cx, intermediate_cy = optimize_center(processed_data, initial_cx, initial_cy)
+        
+        # (2단계) 더 정밀한 탐색을 위해 한 번 더 반복 실행
+        final_cx, final_cy = optimize_center(processed_data, intermediate_cx, intermediate_cy)
+        
+        # 슬라이싱된 이미지의 피팅 좌표를 전체 해상도 원본 이미지 좌표계로 복원
+        final_cx_original = final_cx + margin_x
+        final_cy_original = final_cy + margin_y
+        
+        return float(final_cx_original), float(final_cy_original)
+        
     except Exception as e:
-        # skimage가 설치되지 않았거나, 허프 변환 실패 시 예전 물리적 지평선 로직으로 안전하게 폴백(Fallback)
+        import traceback
+        # 예기치 않은 모듈 에러 시 구버전 안전 로직으로 폴백
         return _fallback_calibrate_center(img_data, base_x, base_y, window)
 
 
