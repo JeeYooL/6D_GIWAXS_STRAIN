@@ -135,10 +135,13 @@ if uploaded_files:
     if st.session_state.strain_results is not None:
         st.divider()
         st.subheader("📊 최종 Strain 분석 결과")
-        st.dataframe(st.session_state.strain_results)
-        # 트렌드 그래프 추가
-        fig_tr, ax_tr = plt.subplots()
-        ax_tr.plot(st.session_state.strain_results["입사각"], st.session_state.strain_results["Strain(%)"], 'ro-')
-        ax_tr.set_xlabel("Incidence Angle (deg)")
-        ax_tr.set_ylabel("Strain (%)")
-        st.pyplot(fig_tr)
+        if st.session_state.strain_results.empty:
+            st.warning("⚠️ 성공적으로 분석된 데이터가 없습니다. 피크가 잡히지 않았거나 데이터가 부족합니다. 적분 각도(Azimuth)와 Fit(q) 영역을 다시 조절해 보세요.")
+        else:
+            st.dataframe(st.session_state.strain_results)
+            # 트렌드 그래프 추가
+            fig_tr, ax_tr = plt.subplots()
+            ax_tr.plot(st.session_state.strain_results["입사각"], st.session_state.strain_results["Strain(%)"], 'ro-')
+            ax_tr.set_xlabel("Incidence Angle (deg)")
+            ax_tr.set_ylabel("Strain (%)")
+            st.pyplot(fig_tr)
