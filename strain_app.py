@@ -55,7 +55,24 @@ q_max = st.sidebar.number_input("Fit 영역 끝 q", value=2.0)
 critical_angle = st.sidebar.number_input("물질 Critical Angle (deg)", value=0.14, format="%.3f")
 
 # --- 파일 업로드 영역 ---
-uploaded_files = st.sidebar.file_uploader("📂 TIF 데이터 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+st.sidebar.subheader("📂 데이터 업로드 방식")
+use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
+
+uploaded_files = []
+if use_sample_data:
+    sample_dir = "sample_data"
+    if os.path.exists(sample_dir):
+        for fname in os.listdir(sample_dir):
+            if fname.lower().endswith(('.tif', '.tiff')):
+                fpath = os.path.join(sample_dir, fname)
+                with open(fpath, "rb") as f:
+                    file_obj = io.BytesIO(f.read())
+                    file_obj.name = fname
+                    uploaded_files.append(file_obj)
+    if not uploaded_files:
+        st.sidebar.warning(f"❌ `{sample_dir}` 폴더가 비어 있거나 TIF 파일이 없습니다. 파일을 넣어주세요!")
+else:
+    uploaded_files = st.sidebar.file_uploader("📂 TIF 데이터 직접 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
 
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
