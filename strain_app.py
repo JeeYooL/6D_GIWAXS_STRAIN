@@ -101,6 +101,40 @@ if uploaded_files:
                         "q_measured": q_exp,
                         "Strain(%)": (q_bulk - q_exp) / q_exp * 100
                     })
+                    
+                    # --- 1D 및 2D 그래프 출력 ---
+                    with st.expander(f"📊 {row['파일명']} 상세 결과 (입사각: {row['입사각(deg)']}°)"):
+                        c_2d, c_1d = st.columns(2)
+                        
+                        # 2D GIWAXS 그래프
+                        with c_2d:
+                            fig2d, ax2d = plt.subplots(figsize=(5, 4))
+                            im = ax2d.imshow(np.log1p(np.clip(img, 0, None)), cmap='jet', origin='lower')
+                            ax2d.set_title("2D GIWAXS Pattern")
+                            ax2d.axis('off')
+                            plt.colorbar(im, ax=ax2d, fraction=0.046, pad=0.04)
+                            st.pyplot(fig2d)
+                            plt.close(fig2d)
+                            
+                        # 1D XRD 프로파일 및 Fitting 결과
+                        with c_1d:
+                            fig1d, ax1d = plt.subplots(figsize=(5, 4))
+                            ax1d.plot(q, I, 'k-', alpha=0.3, label='Whole Profile')
+                            ax1d.plot(q_c, I_c, 'bo', markersize=3, label='Fit Range Data')
+                            ax1d.plot(q_c, out.best_fit, 'r-', linewidth=2, label='Gaussian Fit')
+                            ax1d.axvline(x=q_exp, color='g', linestyle='--', label=f'Peak: {q_exp:.4f}')
+                            
+                            ax1d.set_xlim(max(0, q_min - 0.3), q_max + 0.3)
+                            
+                            max_I = np.max(I_c) if len(I_c) > 0 else 1
+                            ax1d.set_ylim(0, max_I * 1.5)
+                            
+                            ax1d.set_xlabel("q (Å⁻¹)")
+                            ax1d.set_ylabel("Intensity (a.u.)")
+                            ax1d.set_title("1D Profile & Peak Fitting")
+                            ax1d.legend(fontsize=8)
+                            st.pyplot(fig1d)
+                            plt.close(fig1d)
                 except Exception as e:
                     st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
