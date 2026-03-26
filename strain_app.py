@@ -178,18 +178,48 @@ if uploaded_files:
                     txt = pd.DataFrame({"q_out": q_out, "I_out": I_out, "q_in": q_in, "I_in": I_in}).to_csv(sep='\t', index=False)
                     zip_file.writestr(f"{row['파일명']}_1D.txt", txt)
 
-                    # --- 피팅 함수 정의 ---
+                    # --- [강화된 다중 피크(Multi-Peak) 피팅 함수] ---
                     def fit_peak(q, I):
+                        from scipy.signal import find_peaks
                         mask = (q >= q_min) & (q <= q_max)
                         qc, Ic = q[mask], I[mask]
                         if len(qc) < 5: return None, None, None, None
                         
-                        model = GaussianModel() + LinearModel()
-                        params = model.make_params(amplitude=Ic.max()-Ic.min(), center=(q_min+q_max)/2, sigma=0.05, slope=0, intercept=Ic.min())
-                        params['center'].set(min=q_min, max=q_max)
+                        # 1. 주어진 q 범위 내에서 눈에 띄는(prominence) 모든 피크 위치를 탐색
+                        peaks, _ = find_peaks(Ic, prominence=0.03 * (Ic.max() - Ic.min()), distance=5)
+                        
+                        # 피크가 하나도 검색되지 않으면 단순히 가장 큰 값을 피크 배열로 간주
+                        if len(peaks) == 0:
+                            peaks = [np.argmax(Ic)]
+                            
+                        # 2. 다중 피크 피팅을 위한 동적 모델(Composite Model) 생성
+                        # 기본 배경(Background)을 위한 Linear 모델 추가
+                        model = LinearModel(prefix='bkg_')
+                        params = model.make_params(slope=0, intercept=Ic.min())
+                        
+                        # 찾은 각각의 피크마다 별도의 Gaussian 모델을 생성하여 전체 모델에 덧셈
+                        for i, p_idx in enumerate(peaks):
+                            center_guess = qc[p_idx]
+                            amp_guess = (Ic[p_idx] - Ic.min()) * 0.05
+                            
+                            p_model = GaussianModel(prefix=f'p{i}_')
+                            p_params = p_model.make_params(amplitude=amp_guess, center=center_guess, sigma=0.02)
+                            
+                            # 해당 피크 중심이 초기 추측값 근처(±0.05)를 벗어나 엉뚱하게 발산하는 것을 방지
+                            p_params[f'p{i}_center'].set(min=center_guess - 0.05, max=center_guess + 0.05)
+                            
+                            model += p_model
+                            params.update(p_params)
+                            
+                        # 3. 모델 피팅 수행
                         out = model.fit(Ic, params, x=qc)
-                        q_exp = out.params['center'].value
-                        strain = (q_bulk - q_exp) / q_exp * 100
+                        
+                        # 4. 피팅된 여러 개의 피크들 중에서, 우리가 관심 있는 '기준 q_bulk'와 가장 가까운 메인 피크를 선택
+                        centers = [out.params[f'p{i}_center'].value for i in range(len(peaks))]
+                        best_center = min(centers, key=lambda c: abs(c - q_bulk))
+                        
+                        # 5. 메인 피크 기준으로 변형률(Strain) 계산
+                        strain = (q_bulk - best_center) / best_center * 100
                         return qc, Ic, out, strain
 
                     # 두 방향 각각 피팅
@@ -204,7 +234,7 @@ if uploaded_files:
                                     "Strain_Out(%)": strain_out, "Strain_In(%)": strain_in})
                     
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
-                        c1, c2 = st.columns(2)
+                        c1, c2, c3 = st.columns(3)
                         with c1:
                             # 2D GIWAXS 패턴
                             h, w = img_data.shape
@@ -215,27 +245,21 @@ if uploaded_files:
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
-                            # 1D 피팅 결과 (Out: Blue, In: Red 이중 축)
-                            fig1d, ax_out = plt.subplots()
-                            
-                            ax_out.plot(qc_out, Ic_out, 'bo', markersize=3, label='Out Data')
-                            ax_out.plot(qc_out, fit_out.best_fit, 'b-', label='Out Fit')
-                            ax_out.set_ylabel("Intensity (Out)", color='b')
-                            ax_out.tick_params(axis='y', labelcolor='b')
-                            
-                            ax_in = ax_out.twinx()
-                            ax_in.plot(qc_in, Ic_in, 'ro', markersize=3, label='In Data')
-                            ax_in.plot(qc_in, fit_in.best_fit, 'r-', label='In Fit')
-                            ax_in.set_ylabel("Intensity (In)", color='r')
-                            ax_in.tick_params(axis='y', labelcolor='r')
-                            
-                            ax_out.set_title(f"Out: {strain_out:.3f}% | In: {strain_in:.3f}%")
-                            
-                            lines1, labels1 = ax_out.get_legend_handles_labels()
-                            lines2, labels2 = ax_in.get_legend_handles_labels()
-                            ax_out.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-                            
-                            st.pyplot(fig1d); plt.close(fig1d)
+                            # 1D 피팅 결과 (Out-of-plane)
+                            fig_out, ax_out = plt.subplots()
+                            ax_out.plot(qc_out, Ic_out, 'bo', markersize=3, label='Data')
+                            ax_out.plot(qc_out, fit_out.best_fit, 'r-', label='Fit')
+                            ax_out.set_title(f"Out-of-plane Strain: {strain_out:.3f}%")
+                            ax_out.set_xlabel(r"$q_z (\AA^{-1})$"); ax_out.legend()
+                            st.pyplot(fig_out); plt.close(fig_out)
+                        with c3:
+                            # 1D 피팅 결과 (In-plane)
+                            fig_in, ax_in = plt.subplots()
+                            ax_in.plot(qc_in, Ic_in, 'bo', markersize=3, label='Data')
+                            ax_in.plot(qc_in, fit_in.best_fit, 'r-', label='Fit')
+                            ax_in.set_title(f"In-plane Strain: {strain_in:.3f}%")
+                            ax_in.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax_in.legend()
+                            st.pyplot(fig_in); plt.close(fig_in)
                             
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
