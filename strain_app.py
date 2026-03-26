@@ -284,9 +284,21 @@ if uploaded_files:
                         # 3. 모델 피팅 수행
                         out = model.fit(Ic, params, x=qc)
                         
-                        # 4. 피팅된 여러 개의 피크들 중에서, 우리가 관심 있는 '기준 q_bulk'와 가장 가까운 메인 피크를 선택
-                        centers = [out.params[f'p{i}_center'].value for i in range(len(peaks))]
-                        best_center = min(centers, key=lambda c: abs(c - q_bulk))
+                        # 4. q_bulk 근방(±0.15) 피크들 중 amplitude가 가장 큰 메인 피크를 선택
+                        #    (가장 가까운 피크 선택 시, 비슷한 거리의 두 피크 사이에서 부호가 뒤집히는 버그 방지)
+                        candidates = []
+                        for j in range(len(peaks)):
+                            c_val = out.params[f'p{j}_center'].value
+                            a_val = out.params[f'p{j}_amplitude'].value
+                            if abs(c_val - q_bulk) < 0.15:
+                                candidates.append((c_val, a_val))
+                        
+                        if candidates:
+                            best_center = max(candidates, key=lambda x: x[1])[0]
+                        else:
+                            # 근방에 후보가 없으면 기존 방식(가장 가까운 피크) 폴백
+                            centers = [out.params[f'p{j}_center'].value for j in range(len(peaks))]
+                            best_center = min(centers, key=lambda c: abs(c - q_bulk))
                         
                         # 5. 메인 피크 기준으로 변형률(Strain) 계산
                         strain = (q_bulk - best_center) / best_center * 100
