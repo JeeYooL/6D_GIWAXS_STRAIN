@@ -46,19 +46,16 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=20):
             
         else:
             # --- 전체 1단계 초기 탐색 (Global Search) 모드 ---
-            # 극단 가장자리 에러 박스나 디텍터 갭(우측 붉은 네모 등)을 원천 차단하기 위해 마진 지정
             margin_x = int(w * 0.20)
+            margin_y = int(h * 0.10)
             
-            # 좌우 20% 마진을 자른 안전 구역(Safe center region)
-            safe_region = clipped[:, margin_x:w-margin_x]
+            safe_region = clipped[margin_y:h-margin_y, margin_x:w-margin_x]
             
-            # Step 1: DBy 찾기 (중앙 구역의 수직 그라디언트 최대 지점을 지평선으로 간주)
             v_profile = np.sum(safe_region, axis=1)
             v_gradient = np.abs(np.diff(v_profile))
-            dby_auto = np.argmax(v_gradient)
+            dby_auto = margin_y + np.argmax(v_gradient)
             
-            # Step 2: DBx 찾기 (검출된 지평선 위에서 가장 어두운 지점을 빔스탑으로 간주)
-            h_profile = safe_region[dby_auto, :]
+            h_profile = safe_region[dby_auto - margin_y, :]
             dbx_auto = margin_x + np.argmin(h_profile)
             
             return float(dbx_auto), float(dby_auto)
@@ -84,14 +81,19 @@ pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 st.sidebar.divider()
 st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
 
-# [기능 추가] 자동 정렬 버튼
-if st.sidebar.button("🪄 빔 센터 자동 찾기 (지평선 기반)"):
-    # 현재 업로드된 파일이 있는지 확인
+# [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
+if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
     if 'current_img' in st.session_state:
-        dbx_a, dby_a = auto_calibrate_center(st.session_state.current_img)
+        # 이미 세션 상태에 저장되어 있는 현재 (dbx, dby) 주변 ±100px 영역으로 국한하여 안전하고 정확하게 탐색
+        dbx_a, dby_a = auto_calibrate_center(
+            st.session_state.current_img, 
+            base_x=st.session_state.dbx, 
+            base_y=st.session_state.dby, 
+            window=100
+        )
         st.session_state.dbx = dbx_a
         st.session_state.dby = dby_a
-        st.sidebar.success(f"자동 정렬 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
+        st.sidebar.success(f"미세조정 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
     else:
         st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
 
