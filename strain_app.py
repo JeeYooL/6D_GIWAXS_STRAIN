@@ -75,8 +75,25 @@ st.sidebar.subheader("🎯 1D 적분 각도 설정")
 azi_min = st.sidebar.number_input("최소 Azimuth (°)", value=-180)
 azi_max = st.sidebar.number_input("최대 Azimuth (°)", value=0)
 
-# --- 파일 업로드 ---
-uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+# --- 파일 업로드 방식 결정 ---
+st.sidebar.subheader("📂 데이터 업로드 방식")
+use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
+
+uploaded_files = []
+if use_sample_data:
+    sample_dir = "sample_data"
+    if os.path.exists(sample_dir):
+        for fname in os.listdir(sample_dir):
+            if fname.lower().endswith(('.tif', '.tiff')):
+                fpath = os.path.join(sample_dir, fname)
+                with open(fpath, "rb") as f:
+                    file_obj = io.BytesIO(f.read())
+                    file_obj.name = fname
+                    uploaded_files.append(file_obj)
+    if not uploaded_files:
+        st.sidebar.warning(f"❌ `{sample_dir}` 폴더가 비어 있거나 TIF 파일이 없습니다. 파일을 넣어주세요!")
+else:
+    uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
 
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
@@ -93,7 +110,28 @@ if uploaded_files:
     input_df = pd.DataFrame({"파일명": file_list, "입사각(deg)": angles})
     edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor_auto")
 
-    if st.button("🚀 전수 분석 시작", type="primary"):
+    # --- [검증용] 실시간 2D 프리뷰 (센터 표시) ---
+    st.subheader("🖼️ 현재 빔 센터 정렬 확인 (Preview) - 가장 위의 이미지 기준")
+    img_preview = st.session_state.current_img
+    flipped_img = np.flipud(img_preview)
+    
+    fig_pre, ax_pre = plt.subplots(figsize=(6, 4))
+    im_pre = ax_pre.imshow(np.log1p(np.clip(flipped_img, 0, None)), cmap='jet')
+    
+    # 십자선 표시 (Flip 고려)
+    h_pre, w_pre = img_preview.shape
+    if dbx is not None and dby is not None:
+        ax_pre.axvline(x=dbx, color='white', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax_pre.axhline(y=h_pre-dby, color='white', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax_pre.scatter(dbx, h_pre-dby, color='red', s=100, marker='+', label='Current Center')
+    
+    ax_pre.set_title(f"Center Preview (X={dbx:.1f}, Y={dby:.1f})")
+    plt.colorbar(im_pre, ax=ax_pre)
+    st.pyplot(fig_pre)
+    plt.close(fig_pre)
+    st.info("💡 위 이미지의 **빨간 십자선(+)**이 파란색 빔스탑의 정중앙에 위치하는지 확인하시고 아래 버튼을 누르세요.")
+
+    if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
         temp_dir = "temp_giwaxs"
         os.makedirs(temp_dir, exist_ok=True)
         paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
@@ -156,10 +194,15 @@ if uploaded_files:
     if st.session_state.analysis_results is not None:
         st.divider(); st.subheader("📈 입사각별 Strain 트렌드")
         res_df = st.session_state.analysis_results
-        c1, c2 = st.columns([1, 1.5])
-        with c1:
-            st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
-            st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv_auto")
-        with c2:
-            fig_tr, ax_tr = plt.subplots()
-            ax_tr.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-'); ax_tr.set_xlabel("Incidence Angle (deg)"); ax_tr.set_ylabel("Strain (%)"); st.pyplot(fig_tr)
+        if res_df.empty:
+            st.warning("⚠️ 성공적으로 분석된 데이터가 없습니다. 피크가 잡히지 않았거나 데이터가 부족합니다. 적분 각도(Azimuth)와 Fit(q) 영역을 다시 조절해 보세요.")
+        else:
+            c1, c2 = st.columns([1, 1.5])
+            with c1:
+                st.dataframe(res_df.style.format({"q_measured": "{:.4f}", "Strain(%)": "{:.3f}"}))
+                st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv_auto")
+            with c2:
+                fig_tr, ax_tr = plt.subplots()
+                ax_tr.plot(res_df["입사각"], res_df["Strain(%)"], 'ro-'); ax_tr.set_xlabel("Incidence Angle (deg)"); ax_tr.set_ylabel("Strain (%)")
+                st.pyplot(fig_tr)
+                plt.close(fig_tr)
