@@ -84,6 +84,10 @@ pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 st.sidebar.divider()
 st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
 
+# 수동 조정 입력창 (세션 상태와 연동)
+dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
+dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
+
 # [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
 if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
     if 'current_img' in st.session_state:
@@ -99,10 +103,6 @@ if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
         st.sidebar.success(f"미세조정 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
     else:
         st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
-
-# 수동 조정 입력창 (세션 상태와 연동)
-dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
-dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
 
 wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
