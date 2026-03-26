@@ -24,8 +24,17 @@ st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
 energy_kev = st.sidebar.number_input("Energy (keV)", value=11.564, format="%.3f")
 dist_mm = st.sidebar.number_input("SDD (mm)", value=100.0, format="%.3f") # SDD 100으로 설정 시 정상 작동 확인
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
-dbx = st.sidebar.number_input("DBx (Center X - 1)", value=1440.36)
-dby = st.sidebar.number_input("DBy (Center Y - 1)", value=1053.49)
+
+st.sidebar.divider()
+st.sidebar.subheader("🎯 빔 센터(Beam Center) 자동 정렬")
+st.sidebar.info("💡 $q=0$ 원점이 직접 빔과 빗나가는 경우 자동 찾기를 권장합니다.")
+use_auto_center = st.sidebar.checkbox("✅ 이미지에서 빔 센터 자동 추적", value=True, help="상위 0.1% 가장 밝은 영역의 무게중심을 계산하여 자동으로 빔 센터를 맞춥니다.")
+
+if not use_auto_center:
+    dbx_manual = st.sidebar.number_input("DBx (Center X - 1)", value=1440.36)
+    dby_manual = st.sidebar.number_input("DBy (Center Y - 1)", value=1053.49)
+else:
+    dbx_manual, dby_manual = None, None
 
 wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
@@ -79,10 +88,6 @@ if uploaded_files:
         for uf in uploaded_files:
             with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
 
-        # pyFAI 엔진 (물리적 계산용 - 원본 좌표계 유지)
-        geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
-                                  wavelength=wavelength, pixel1=px_m, pixel2=px_m)
-        
         results, zip_buffer = [], io.BytesIO()
         
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
@@ -90,6 +95,20 @@ if uploaded_files:
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
+                    
+                    # [자동 정렬] 빔 센터 계산
+                    if use_auto_center:
+                        threshold = np.percentile(img_data, 99.9)
+                        mask = img_data > threshold
+                        y_idx, x_idx = np.nonzero(mask)
+                        dby = np.average(y_idx, weights=img_data[mask])
+                        dbx = np.average(x_idx, weights=img_data[mask])
+                    else:
+                        dbx, dby = dbx_manual, dby_manual
+
+                    # pyFAI 엔진 (물리적 계산용 - 이미지마다 동적 원점 갱신)
+                    geo = AzimuthalIntegrator(dist=dist_m, poni1=dby*px_m, poni2=dbx*px_m, 
+                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m)
                     
                     # [계산] 설정된 각도 범위로 1D 적분
                     q, I = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_min, azi_max))
