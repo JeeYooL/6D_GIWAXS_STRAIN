@@ -22,7 +22,7 @@ st.title("🔬 6D GIWAXS Strain 분석 (이미지 반전 & 피팅 오류 수정)
 # --- 사이드바: 실험 셋업 ---
 st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
 energy_kev = st.sidebar.number_input("Energy (keV)", value=11.564, format="%.3f")
-dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f") # SDD 200으로 기본값 수정
+dist_mm = st.sidebar.number_input("SDD (mm)", value=100.0, format="%.3f") # SDD 100으로 설정 시 정상 작동 확인
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 dbx = st.sidebar.number_input("DBx (Center X - 1)", value=1440.36)
 dby = st.sidebar.number_input("DBy (Center Y - 1)", value=1053.49)
@@ -123,11 +123,22 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석 (이미지 반전 완료)"):
                         c1, c2 = st.columns(2)
                         with c1:
-                            # [요청 반영] 시각적으로 하반원을 위로 Flip
+                            # [논문 표기법 적용] q_xy, q_z 축으로 변환
+                            h, w = img_data.shape
+                            k = 2 * np.pi / (wavelength * 1e10) # Å^-1
+                            dq = k * (px_m / dist_m) # 픽셀 당 q 변화량 근사
+                            
+                            q_xy_min, q_xy_max = -dbx * dq, (w - dbx) * dq
+                            q_z_min, q_z_max = -dby * dq, (h - dby) * dq
+                            
                             img_flipped = np.flipud(img_data)
                             fig2d, ax2d = plt.subplots()
-                            im = ax2d.imshow(np.log1p(np.clip(img_flipped, 0, None)), cmap='jet')
-                            ax2d.set_title("Visualized GIWAXS (Bottom half at Top)")
+                            im = ax2d.imshow(np.log1p(np.clip(img_flipped, 0, None)), 
+                                             cmap='jet', 
+                                             extent=[q_xy_min, q_xy_max, q_z_min, q_z_max])
+                            ax2d.set_title("2D GIWAXS")
+                            ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$")
+                            ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             plt.colorbar(im, ax=ax2d)
                             st.pyplot(fig2d)
                             plt.close(fig2d)
