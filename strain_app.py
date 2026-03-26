@@ -152,8 +152,8 @@ azi_out_min = c_out1.number_input("Out 최소(°)", value=-100)
 azi_out_max = c_out2.number_input("Out 최대(°)", value=-80)
 
 c_in1, c_in2 = st.sidebar.columns(2)
-azi_in_min = c_in1.number_input("In 최소(°)", value=-21)
-azi_in_max = c_in2.number_input("In 최대(°)", value=-1)
+azi_in_min = c_in1.number_input("In 최소(°)", value=-15)
+azi_in_max = c_in2.number_input("In 최대(°)", value=-5)
 
 # --- 파일 업로드 방식 결정 ---
 st.sidebar.subheader("📂 데이터 업로드 방식")
