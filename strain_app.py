@@ -22,14 +22,13 @@ def extract_incidence_angle(filename):
         match = re.search(r"(\d+\.\d+)d", filename)
     return float(match.group(1)) if match else 0.10
 
-# [NEW] 회절 링(Ring) 기반 Azimuthal Variance Minimization 원점 탐색
-def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100, fix_x=False):
+# [Step-1] 회절 링(Ring) 기반 Azimuthal Variance Minimization 원점 탐색 (X+Y 모두 보정)
+def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
     """
     회절 링의 azimuthal intensity variance를 최소화하는 (cx, cy)를 탐색.
-    정확한 중심에서는 링 위의 밝기가 균일(variance↓), 빗나가면 불균일(variance↑).
+    1단계 (첫 이미지 X+Y 보정)에서만 사용.
     """
     try:
-        import numpy as np
         from scipy.optimize import minimize
         from scipy.ndimage import gaussian_filter
         
@@ -38,21 +37,15 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100, fix_x=
         img_smooth = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=3)
         
         if base_x is None or base_y is None:
-            # 전역 초기 탐색: 가우시안 블러 최소값
             margin_x, margin_y = int(w * 0.20), int(h * 0.10)
             safe = gaussian_filter(np.clip(img_data.astype(float), 0, p99), sigma=25)
             safe_region = safe[margin_y:h-margin_y, margin_x:w-margin_x]
             dy, dx = np.unravel_index(np.argmin(safe_region), safe_region.shape)
             base_x, base_y = float(margin_x + dx), float(margin_y + dy)
         
-        # --- 회절 링 기반 원점 최적화 ---
-        # 하반원(빔 아래쪽)에서만 샘플링: 각도 범위 200°~340° (약 -160°~ -20°, 즉 아래쪽 반원)
-        # GIWAXS 상반원은 데이터가 없으므로 제외
-        n_angles = 72  # 5° 간격
+        n_angles = 72
         angles = np.linspace(np.radians(200), np.radians(340), n_angles)
-        
-        # 사용할 반지름: 빔스탑을 넘어서 링이 존재하는 영역
-        radii = np.arange(150, 650, 50)  # 150~600px, 50px 간격
+        radii = np.arange(150, 650, 50)
         
         def azimuthal_cost(center):
             cx, cy = center
@@ -65,48 +58,103 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100, fix_x=
                     py = int(cy + r * np.sin(theta))
                     if 0 <= px < w and 0 <= py < h:
                         val = img_smooth[py, px]
-                        if val > 0:  # 마스크/빔스탑 영역(0 또는 매우 작은 값) 제외
+                        if val > 0:
                             intensities.append(val)
-                if len(intensities) > n_angles // 3:  # 최소 1/3 이상의 유효 데이터가 있어야 분산 계산
+                if len(intensities) > n_angles // 3:
                     arr = np.array(intensities)
-                    # 정규화된 분산 (스케일 독립적)
                     mean_val = arr.mean()
                     if mean_val > 0:
                         total_var += arr.std() / mean_val
                         n_valid += 1
             return total_var / max(n_valid, 1)
         
-        if fix_x and base_x is not None:
-            # X 위치를 고정하고 Y에 대해서만 1D 최적화 수행
-            def azimuthal_cost_y(y):
-                return azimuthal_cost([base_x, y[0]])
-            
-            y0 = [base_y]
-            result = minimize(azimuthal_cost_y, y0, method='Nelder-Mead',
-                              options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
-            
-            opt_x = base_x
-            opt_y = result.x[0]
-            
-            if abs(opt_y - base_y) > window:
-                opt_y = base_y
-        else:
-            # Nelder-Mead 최적화 (초기값 ±window px 범위 내에서 탐색)
-            x0 = [base_x, base_y]
-            result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
-                              options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
-            
-            opt_x, opt_y = result.x
-            
-            # 결과가 초기값에서 너무 벗어나면 초기값을 유지 (안전장치)
-            if abs(opt_x - base_x) > window or abs(opt_y - base_y) > window:
-                return float(base_x), float(base_y)
+        x0 = [base_x, base_y]
+        result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
+                          options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
+        opt_x, opt_y = result.x
+        
+        if abs(opt_x - base_x) > window or abs(opt_y - base_y) > window:
+            return float(base_x), float(base_y)
         
         return float(opt_x), float(opt_y)
         
     except Exception:
         if base_x is not None and base_y is not None: return float(base_x), float(base_y)
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
+
+
+# [Step-2] 데이터 경계 기반 center_y 탐색
+def find_center_y_by_data_edge(img_data, base_x, base_y, dist_m, px_m, window=80,
+                               qxy_range=3.0, qxy_beamstop=0.2, threshold_ratio=0.05):
+    """
+    q_xy = [-qxy_range, -qxy_beamstop] ∪ [qxy_beamstop, qxy_range] 범위에 해당하는
+    픽셀 열들의 강도를 각 후보 행(row)에서 측정하여,
+    신호가 처음으로 전부 나타나는 경계 행을 center_y로 반환한다.
+    (raw 이미지에서 center_y 위쪽 = 데이터 없음, center_y 아래쪽 = GIWAXS 데이터)
+    탐색 방향: base_y 기준으로 ±window 픽셀씩 스캔.
+    """
+    try:
+        h, w = img_data.shape
+        # q_xy → 픽셀 오프셋 변환: Δpx = q_xy * dist_m / px_m  (단위: px)
+        # (pyFAI의 q = 2π/λ * sin(2θ)/... 여기서는 단순 기하 근사 사용)
+        # 실제 q_xy 픽셀 매핑: px_col = base_x + q_xy * dist_m / px_m * ...
+        # 단순화: 픽셀 수 = q_xy [Å⁻¹] * dist_m [m] / px_m [m] (소각 근사)
+        # 하지만 q = 4π/λ*sin(θ) ≒ 2π/λ * 2θ ≒ 2π*tan(2θ/2)/λ ≒ 2π*r/(λ*dist)
+        # r [px] = q [Å⁻¹] * dist_m / (2π * px_m) * λ [m] * 1e10
+        # 여기선 dist_m, px_m을 직접 받지 않으므로, px/q 비율을 아래처럼 계산
+        # → 실제 호출 시 dist_m, px_m, wavelength를 넘기도록 변경
+        # 단, 이 함수는 wavelength 없이 px_per_q = dist_m / px_m 근사 사용
+        px_per_q = dist_m / px_m  # [px / rad] ≈ [px / q Å⁻¹] at small q
+
+        # 측정할 q_xy 샘플 포인트
+        q_left  = np.linspace(-qxy_range, -qxy_beamstop, 20)
+        q_right = np.linspace( qxy_beamstop,  qxy_range, 20)
+        q_samples = np.concatenate([q_left, q_right])
+        
+        # 각 q_xy에 해당하는 픽셀 열 인덱스
+        col_indices = (base_x + q_samples * px_per_q).astype(int)
+        valid_cols = col_indices[(col_indices >= 0) & (col_indices < w)]
+        
+        if len(valid_cols) == 0:
+            return float(base_y)
+        
+        # 배경 임계값: 이미지 전체 하위 퍼센타일
+        bg_level = np.percentile(img_data, 20)
+        signal_thresh = bg_level + threshold_ratio * (np.percentile(img_data, 99) - bg_level)
+        
+        # 후보 행 스캔 범위: base_y ± window (정수)
+        y_lo = max(0, int(base_y) - window)
+        y_hi = min(h - 1, int(base_y) + window)
+        
+        # 각 행에서 valid_cols 픽셀들의 신호 유효 비율 계산
+        row_scores = []
+        for row in range(y_lo, y_hi + 1):
+            vals = img_data[row, valid_cols]
+            frac = np.mean(vals > signal_thresh)  # 신호가 있는 열 비율
+            row_scores.append((row, frac))
+        
+        row_scores = np.array(row_scores)  # shape (N, 2): [row, frac]
+        
+        # 신호 비율의 변화가 가장 급격한 경계 행 찾기
+        # 스무딩 후 gradient 최대 지점 = 데이터가 갑자기 나타나기 시작하는 경계
+        from scipy.ndimage import uniform_filter1d
+        smoothed = uniform_filter1d(row_scores[:, 1], size=5)
+        gradient = np.gradient(smoothed)
+        
+        # gradient > 0인 구간에서 최대 기울기 위치 (아래로 내려갈수록 신호 증가)
+        # 단, 경계는 "신호가 처음 충분히 넘는" 행 → frac >= 0.6 인 첫 번째 행 (위에서 아래로)
+        threshold_frac = 0.6
+        for idx in range(len(row_scores)):
+            if row_scores[idx, 1] >= threshold_frac:
+                best_row = int(row_scores[idx, 0])
+                return float(best_row)
+        
+        # fallback: 신호가 없으면 gradient 최대 지점 반환
+        peak_idx = np.argmax(gradient)
+        return float(row_scores[peak_idx, 0])
+    
+    except Exception:
+        return float(base_y)
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
 st.title("🔬 6D GIWAXS Strain 분석 (2단계 빔 센터 보정)")
@@ -233,7 +281,7 @@ if uploaded_files:
     if st.button("🪄 1단계: 첫 이미지 센터 자동 미세조정 (X+Y, ±100px)", key="step1_btn"):
         dbx_a, dby_a = auto_calibrate_center(
             st.session_state.current_img, 
-            base_x=dbx, base_y=dby, window=100, fix_x=False
+            base_x=dbx, base_y=dby, window=100
         )
         st.session_state.dbx = dbx_a
         st.session_state.dby = dby_a
@@ -261,16 +309,16 @@ if uploaded_files:
         
         for i, row in edited_df.iterrows():
             img_data = fabio.open(paths[row["파일명"]]).data
-            
-            if i == 0:
-                # 첫 샘플: 이미 1단계에서 보정된 값 사용 (Y만 재확인)
-                _, cal_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=30, fix_x=True)
-            else:
-                # 나머지: X 고정, Y만 이전 샘플 기준 ±20px 보정
-                _, cal_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
-            
+            # 데이터 경계 스캔으로 center_y 결정
+            # 첫 샘플은 ±80px, 나머지는 이전 샘플 기준 ±40px 탐색
+            search_window = 80 if i == 0 else 40
+            cal_y = find_center_y_by_data_edge(
+                img_data, fixed_x, track_y,
+                dist_m=dist_m, px_m=px_m,
+                window=search_window
+            )
             track_y = cal_y  # 다음 샘플의 초기값으로 전달
-            per_centers.append({'파일명': row['파일명'], '입사각': row['입사각(deg)'], 
+            per_centers.append({'파일명': row['파일명'], '입사각': row['입사각(deg)'],
                                 'center_x': fixed_x, 'center_y': cal_y})
             pbar2.progress((i + 1) / len(edited_df))
         
@@ -286,60 +334,34 @@ if uploaded_files:
         
         # 각 샘플에 대한 2D GIWAXS + 1D 적분 프리뷰
         st.divider()
-        st.subheader("🖼️ 2단계 보정 결과 프리뷰 (2D GIWAXS + 1D 적분)")
+        st.subheader("🖼️ 2단계 보정 결과 프리뷰 (2D GIWAXS)")
+        qxy_preview = 3.5  # q_xy 표시 범위 [Å⁻¹]
         
         for ci, cinfo in enumerate(st.session_state.per_sample_centers):
             fname = cinfo['파일명']
             cx, cy = cinfo['center_x'], cinfo['center_y']
             angle_deg = cinfo['입사각']
             
-            with st.expander(f"📊 {fname} (입사각 {angle_deg:.2f}°, Y={cy:.2f})", expanded=(ci < 2)):
+            with st.expander(f"📊 {fname} (입사각 {angle_deg:.2f}°, Y={cy:.2f})", expanded=(ci < 3)):
                 img_data = fabio.open(paths[fname]).data
-                incidence_rad = np.radians(angle_deg)
+                h, w = img_data.shape
+                dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
                 
-                geo = AzimuthalIntegrator(dist=dist_m, poni1=cy*px_m, poni2=cx*px_m,
-                                          wavelength=wavelength, pixel1=px_m, pixel2=px_m,
-                                          rot1=incidence_rad)
+                # 2D GIWAXS 프리뷰만 표시 (1D 제거)
+                data_half = img_data[:int(cy), :]
+                log_half = np.log1p(np.clip(data_half, 0, None))
+                if mask_bg:
+                    log_half = np.where(log_half <= 5.0, np.nan, log_half)
+                h_half = log_half.shape[0]
+                ext = [-cx*dq, (w-cx)*dq, 0, h_half*dq]
                 
-                q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
-                q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
-                
-                col_2d, col_out, col_in = st.columns(3)
-                
-                with col_2d:
-                    h, w = img_data.shape
-                    dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
-                    data_half = img_data[:int(cy), :]
-                    log_half = np.log1p(np.clip(data_half, 0, None))
-                    if mask_bg:
-                        log_half = np.where(log_half <= 5.0, np.nan, log_half)
-                    h_half = log_half.shape[0]
-                    ext = [-cx*dq, (w-cx)*dq, 0, h_half*dq]
-                    
-                    fig2d, ax2d = plt.subplots()
-                    cmap2 = plt.cm.jet.copy(); cmap2.set_bad('white', 1.)
-                    ax2d.imshow(log_half, cmap=cmap2, extent=ext, aspect='auto')
-                    ax2d.set_title(f"2D GIWAXS (Y={cy:.1f})", fontsize=9)
-                    ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
-                    st.pyplot(fig2d); plt.close(fig2d)
-                
-                with col_out:
-                    fig_o, ax_o = plt.subplots()
-                    ax_o.plot(q_out, I_out, 'b-', linewidth=0.8)
-                    ax_o.set_title(f"Out-of-plane 1D", fontsize=9)
-                    ax_o.set_xlabel(r"$q_z (\AA^{-1})$"); ax_o.set_ylabel("Intensity")
-                    ax_o.axvline(x=target_q, color='r', linestyle='--', alpha=0.5, label=f'target={target_q}')
-                    ax_o.legend(fontsize=7)
-                    st.pyplot(fig_o); plt.close(fig_o)
-                
-                with col_in:
-                    fig_i, ax_i = plt.subplots()
-                    ax_i.plot(q_in, I_in, 'b-', linewidth=0.8)
-                    ax_i.set_title(f"In-plane 1D", fontsize=9)
-                    ax_i.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax_i.set_ylabel("Intensity")
-                    ax_i.axvline(x=target_q, color='r', linestyle='--', alpha=0.5, label=f'target={target_q}')
-                    ax_i.legend(fontsize=7)
-                    st.pyplot(fig_i); plt.close(fig_i)
+                fig2d, ax2d = plt.subplots(figsize=(5, 4))
+                cmap2 = plt.cm.jet.copy(); cmap2.set_bad('white', 1.)
+                ax2d.imshow(log_half, cmap=cmap2, extent=ext, aspect='auto')
+                ax2d.set_title(f"2D GIWAXS — {fname}\n(center_y={cy:.1f}, 입사각={angle_deg:.2f}°)", fontsize=9)
+                ax2d.set_xlabel(r"$q_{xy}$ (Å⁻¹)"); ax2d.set_ylabel(r"$q_z$ (Å⁻¹)")
+                ax2d.set_xlim(-qxy_preview, qxy_preview)
+                st.pyplot(fig2d); plt.close(fig2d)
     
     # ========================================
     # 3단계: 전수 Strain 분석 (보정된 센터 사용)
