@@ -15,6 +15,25 @@ from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+# [Bug Fix] OSError: [Errno 22] 방지를 위한 강건한 파일 저장 함수
+def save_uploaded_files(uploaded_files):
+    temp_dir = "temp_giwaxs"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir, exist_ok=True)
+    
+    file_paths = {}
+    for uf in uploaded_files:
+        safe_name = os.path.basename(uf.name).strip()
+        fpath = os.path.join(temp_dir, safe_name)
+        try:
+            if not os.path.exists(fpath) or os.path.getsize(fpath) != uf.size:
+                with open(fpath, "wb") as f:
+                    f.write(uf.getbuffer())
+        except Exception as e:
+            st.error(f"⚠️ `{safe_name}` 저장 실패: {e}")
+        file_paths[uf.name] = fpath
+    return file_paths
+
 # --- 헬퍼 함수 ---
 def extract_incidence_angle(filename):
     match = re.search(r"_(\d+\.\d+)d", filename)
@@ -126,13 +145,14 @@ q_min = st.sidebar.number_input("Fit 영역 시작 q", value=0.95)
 q_max = st.sidebar.number_input("Fit 영역 끝 q", value=1.15)
 
 st.sidebar.subheader("🎯 1D 적분 각도 (Out / In-plane)")
-c_out1, c_out2 = st.sidebar.columns(2)
-azi_out_min = c_out1.number_input("Out 최소(°)", value=-105)
-azi_out_max = c_out2.number_input("Out 최대(°)", value=-75)
+col1, col2 = st.sidebar.columns(2)
+azi_out_min = col1.number_input("Out-min", value=-105.0)
+azi_out_max = col2.number_input("Out-max", value=-75.0)
 
-c_in1, c_in2 = st.sidebar.columns(2)
-azi_in_min = c_in1.number_input("In 최소(°)", value=-20)
-azi_in_max = c_in2.number_input("In 최대(°)", value=-10)
+st.sidebar.markdown("**In-plane Azi (deg)**")
+col3, col4 = st.sidebar.columns(2)
+azi_in_min = col3.number_input("In-min", value=-5.0)
+azi_in_max = col4.number_input("In-max", value=-2.0)
 
 st.sidebar.divider()
 st.sidebar.subheader("🖼️ 시각화 성능 최적화")
@@ -160,16 +180,13 @@ else:
 if uploaded_files:
     file_list = sorted([f.name for f in uploaded_files])
     
-    # [수정] fabio.open() 에러 방지를 위해 우선 모든 파일을 물리적 저장소에 기록
-    temp_dir = "temp_giwaxs"
-    os.makedirs(temp_dir, exist_ok=True)
-    paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
-    for uf in uploaded_files:
-        with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
+    # [수정] OSError [Errno 22] 방지를 위해 개선된 파일 보관 로직
+    paths = save_uploaded_files(uploaded_files)
     
     # 물리적으로 저장된 첫 번째 이미지를 읽어서 캐싱
-    if 'current_img' not in st.session_state or st.session_state.first_file != file_list[0]:
-        st.session_state.current_img = fabio.open(paths[file_list[0]]).data
+    if 'current_img' not in st.session_state or st.session_state.get('first_file') != file_list[0]:
+        with fabio.open(paths[file_list[0]]) as f:
+            st.session_state.current_img = f.data
         st.session_state.first_file = file_list[0]
 
     if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
@@ -312,10 +329,10 @@ if uploaded_files:
                     track_x, track_y = st.session_state.dbx, st.session_state.dby
                     incidence_rad = np.radians(row["입사각(deg)"])
                     
-                    # pyFAI AzimuthalIntegrator로 입사각(rot1) 및 물리적 기하학 보정
+                    # pyFAI AzimuthalIntegrator로 물리적 기하학 보정
+                    # [수정] rot1은 detector azimuthal 회전용이므로 제거
                     geo = AzimuthalIntegrator(dist=dist_m, poni1=track_y*px_m, poni2=track_x*px_m, 
-                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m,
-                                              rot1=incidence_rad)
+                                              wavelength=wavelength, pixel1=px_m, pixel2=px_m)
                                               
                     q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
                     q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
@@ -324,7 +341,7 @@ if uploaded_files:
                     zip_file.writestr(f"{row['파일명']}_1D.txt", txt)
 
                     # --- [Multi-Peak Pseudo-Voigt Fitting] ---
-                    def fit_peak(q, I):
+                    def fit_peak(q, I, is_in_plane=False, incidence_deg=0.1):
                         # 사용자가 지정한 q 범위에서 직접 피팅 (안정적)
                         mask = (q >= q_min) & (q <= q_max)
                         qc, Ic = q[mask], I[mask]
@@ -376,8 +393,38 @@ if uploaded_files:
                             best_center = min(centers, key=lambda c: abs(c - target_q))
                             best_idx = 0
                         
-                        # 5. Strain 계산 (d-spacing 기반 정확 공식: ε = q₀/q - 1)
-                        strain = (q_bulk / best_center - 1) * 100
+                        # 피팅 결과에서 측정된 q 값 추출
+                        q_measured = out.params[f'p{best_idx}_center'].value
+                        
+                        # [수정] In-plane 기하학적 보정 (Steele et al. 2023 근거, Exit angle alpha_f 반영)
+                        if is_in_plane:
+                            # k0 = 2 * pi / wavelength (Angstrom^-1)
+                            k0 = (2 * np.pi) / (wavelength * 1e10)
+                            ai_rad = np.radians(incidence_deg)
+                            
+                            # azimuth 중심각에서 αf 추정
+                            azi_center = np.deg2rad(abs((azi_in_min + azi_in_max) / 2))
+                            # q_measured를 이용해 대략적인 radial distance(px) 역산
+                            r_px_est = q_measured / (k0 * px_m / dist_m)
+                            # 수직 변위(mm) 계산 및 Exit angle alpha_f(rad) 산출
+                            vert_mm = r_px_est * np.sin(azi_center) * px_m * 1e3
+                            af_rad = np.arctan(vert_mm / dist_mm)
+                            
+                            # qz_total = k0 * (sin(ai) + sin(af))
+                            qz_total = k0 * (np.sin(ai_rad) + np.sin(af_rad))
+                            
+                            # q_xy_true = sqrt(q_meas^2 - qz_total^2)
+                            if q_measured**2 > qz_total**2:
+                                q_final = np.sqrt(q_measured**2 - qz_total**2)
+                            else:
+                                q_final = q_measured
+                        else:
+                            # Out-of-plane은 이전과 동일
+                            q_final = q_measured
+
+                        # 보정된 q_final을 사용하여 Strain 계산
+                        # 공식: ε = (q_bulk / q_final - 1) * 100
+                        strain = (q_bulk / q_final - 1) * 100
                         
                         sigma_fit = out.params[f'p{best_idx}_sigma'].value
                         fwhm_fit = sigma_fit * 2.355
@@ -386,7 +433,9 @@ if uploaded_files:
                         r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
                         
                         diagnostics = {
-                            'center': best_center, 'fwhm': fwhm_fit,
+                            'center': q_final, 
+                            'q_raw': q_measured,
+                            'fwhm': fwhm_fit,
                             'r_squared': r_squared, 'n_peaks': len(peaks),
                             'all_peaks': [{
                                 'q': out.params[f'p{j}_center'].value,
@@ -396,8 +445,8 @@ if uploaded_files:
                         
                         return qc, Ic, out, strain, diagnostics
 
-                    result_out = fit_peak(q_out, I_out)
-                    result_in = fit_peak(q_in, I_in)
+                    result_out = fit_peak(q_out, I_out, is_in_plane=False, incidence_deg=row["입사각(deg)"])
+                    result_in = fit_peak(q_in, I_in, is_in_plane=True, incidence_deg=row["입사각(deg)"])
                     
                     if result_out[2] is None or result_in[2] is None:
                         st.warning(f"{row['파일명']}: 피팅 실패")
@@ -405,8 +454,12 @@ if uploaded_files:
                     
                     qc_out, Ic_out, fit_out, strain_out, diag_out = result_out
                     qc_in, Ic_in, fit_in, strain_in, diag_in = result_in
+                    # Strain 계산 (보정 전/후 모두 저장)
+                    strain_in_raw = (q_bulk / diag_in['q_raw'] - 1) * 100
+                    
                     results.append({"파일명": row["파일명"], "입사각": row["입사각(deg)"], 
                                     "Strain_Out(%)": strain_out, "Strain_In(%)": strain_in,
+                                    "Strain_In_Raw(%)": strain_in_raw,
                                     "diag_out": diag_out, "diag_in": diag_in})
                     
                     # --- [Plotting & Report Data Generation] ---
@@ -468,7 +521,9 @@ if uploaded_files:
         
         # DataFrame에는 표시용 컬럼만, diagnostics는 별도 저장
         display_results = [{"파일명": r["파일명"], "입사각": r["입사각"], 
-                            "Strain_Out(%)": r["Strain_Out(%)"], "Strain_In(%)": r["Strain_In(%)"]} 
+                            "Strain_Out(%)": r["Strain_Out(%)"], 
+                            "Strain_In(%)": r["Strain_In(%)"],
+                            "Strain_In_Raw(%)": r["Strain_In_Raw(%)"]} 
                            for r in results]
         st.session_state.analysis_results = pd.DataFrame(display_results)
         st.session_state.wh_results = results  # diagnostics 포함 원본
@@ -483,12 +538,17 @@ if uploaded_files:
         else:
             c1, c2 = st.columns([1, 1.5])
             with c1:
-                st.dataframe(res_df.style.format({"Strain_Out(%)": "{:.3f}", "Strain_In(%)": "{:.3f}"}), width="stretch")
+                st.dataframe(res_df.style.format({
+                    "Strain_Out(%)": "{:.3f}", 
+                    "Strain_In(%)": "{:.3f}",
+                    "Strain_In_Raw(%)": "{:.3f}"
+                }), width="stretch")
                 st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="dl_csv_auto")
             with c2:
                 fig_tr, ax_tr = plt.subplots()
                 ax_tr.plot(res_df["입사각"], res_df["Strain_Out(%)"], 'bo-', label="Out-of-plane")
-                ax_tr.plot(res_df["입사각"], res_df["Strain_In(%)"], 'ro-', label="In-plane")
+                ax_tr.plot(res_df["입사각"], res_df["Strain_In(%)"], 'ro-', label="In-plane (Corrected)")
+                ax_tr.plot(res_df["입사각"], res_df["Strain_In_Raw(%)"], 'k--', alpha=0.5, label="In-plane (Raw)")
                 ax_tr.set_xlabel("Incidence Angle (deg)")
                 ax_tr.set_ylabel("Strain (%)")
                 ax_tr.legend()
@@ -509,16 +569,17 @@ if uploaded_files:
                 
                 # 1. 결과 테이블
                 doc.add_heading('1. Strain Results Table', level=1)
-                table = doc.add_table(rows=1, cols=4, style='Light Shading Accent 1')
+                table = doc.add_table(rows=1, cols=5, style='Light Shading Accent 1')
                 hdr = table.rows[0].cells
                 hdr[0].text = '파일명'; hdr[1].text = '입사각(deg)'
-                hdr[2].text = 'Strain_Out(%)'; hdr[3].text = 'Strain_In(%)'
+                hdr[2].text = 'Strain_Out(%)'; hdr[3].text = 'Strain_In_Corr(%)'; hdr[4].text = 'Strain_In_Raw(%)'
                 for _, r in res_df.iterrows():
                     row_cells = table.add_row().cells
                     row_cells[0].text = str(r['파일명'])
                     row_cells[1].text = f"{r['입사각']:.2f}"
                     row_cells[2].text = f"{r['Strain_Out(%)']:.3f}"
                     row_cells[3].text = f"{r['Strain_In(%)']:.3f}"
+                    row_cells[4].text = f"{r['Strain_In_Raw(%)']:.3f}"
                 
                 # 2. 트렌드 그래프
                 doc.add_heading('2. Strain Trend', level=1)
