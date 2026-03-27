@@ -84,75 +84,52 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
 
 
 # [Step-2] 데이터 경계 기반 center_y 탐색
-def find_center_y_by_data_edge(img_data, base_x, base_y, dist_m, px_m, window=80,
-                               qxy_range=3.0, qxy_beamstop=0.2, threshold_ratio=0.05):
+def find_center_y_by_data_edge(img_data, base_x, base_y, dist_m, px_m, wavelength_m,
+                               window=80, qxy_range=3.0, qxy_beamstop=0.2,
+                               threshold_ratio=0.10):
     """
-    q_xy = [-qxy_range, -qxy_beamstop] ∪ [qxy_beamstop, qxy_range] 범위에 해당하는
-    픽셀 열들의 강도를 각 후보 행(row)에서 측정하여,
-    신호가 처음으로 전부 나타나는 경계 행을 center_y로 반환한다.
-    (raw 이미지에서 center_y 위쪽 = 데이터 없음, center_y 아래쪽 = GIWAXS 데이터)
-    탐색 방향: base_y 기준으로 ±window 픽셀씩 스캔.
+    q_xy = [-qxy_range, -qxy_beamstop] ∪ [qxy_beamstop, qxy_range] 범위 픽셀 열들을
+    base_y ± window 행 범위에서 스캔하여, 신호 취령률이 최대인 행을 center_y로 반환.
+    raw 이미지에서 center_y 위쪽(작은 row index) = GIWAXS 데이터 요나.
+    center_y 자체 행 = 신호가 q_xy 전체에 걸쳐 가장 완전하게 나타나는 위치.
     """
     try:
         h, w = img_data.shape
-        # q_xy → 픽셀 오프셋 변환: Δpx = q_xy * dist_m / px_m  (단위: px)
-        # (pyFAI의 q = 2π/λ * sin(2θ)/... 여기서는 단순 기하 근사 사용)
-        # 실제 q_xy 픽셀 매핑: px_col = base_x + q_xy * dist_m / px_m * ...
-        # 단순화: 픽셀 수 = q_xy [Å⁻¹] * dist_m [m] / px_m [m] (소각 근사)
-        # 하지만 q = 4π/λ*sin(θ) ≒ 2π/λ * 2θ ≒ 2π*tan(2θ/2)/λ ≒ 2π*r/(λ*dist)
-        # r [px] = q [Å⁻¹] * dist_m / (2π * px_m) * λ [m] * 1e10
-        # 여기선 dist_m, px_m을 직접 받지 않으므로, px/q 비율을 아래처럼 계산
-        # → 실제 호출 시 dist_m, px_m, wavelength를 넘기도록 변경
-        # 단, 이 함수는 wavelength 없이 px_per_q = dist_m / px_m 근사 사용
-        px_per_q = dist_m / px_m  # [px / rad] ≈ [px / q Å⁻¹] at small q
 
-        # 측정할 q_xy 샘플 포인트
-        q_left  = np.linspace(-qxy_range, -qxy_beamstop, 20)
-        q_right = np.linspace( qxy_beamstop,  qxy_range, 20)
+        # 정확한 q_xy → 픽셀 열 변환
+        # q [[Å⁻¹]] = 2π * r_px * px_m / (λ * dist_m) ⇒ r_px = q * λ * dist_m / (2π * px_m)
+        # λ [m], dist_m [m], px_m [m]→ r_px 단위는 pixel
+        px_per_q = (wavelength_m * 1e10 * dist_m) / (2 * np.pi * px_m)  # [px per Å⁻¹]
+
+        q_left   = np.linspace(-qxy_range, -qxy_beamstop, 20)
+        q_right  = np.linspace( qxy_beamstop,  qxy_range, 20)
         q_samples = np.concatenate([q_left, q_right])
-        
-        # 각 q_xy에 해당하는 픽셀 열 인덱스
-        col_indices = (base_x + q_samples * px_per_q).astype(int)
-        valid_cols = col_indices[(col_indices >= 0) & (col_indices < w)]
-        
+
+        col_indices = np.round(base_x + q_samples * px_per_q).astype(int)
+        valid_cols  = col_indices[(col_indices >= 0) & (col_indices < w)]
+
         if len(valid_cols) == 0:
             return float(base_y)
-        
-        # 배경 임계값: 이미지 전체 하위 퍼센타일
-        bg_level = np.percentile(img_data, 20)
-        signal_thresh = bg_level + threshold_ratio * (np.percentile(img_data, 99) - bg_level)
-        
-        # 후보 행 스캔 범위: base_y ± window (정수)
+
+        # 신호 임계값
+        bg_level      = np.percentile(img_data, 20)
+        p99_level     = np.percentile(img_data, 99)
+        signal_thresh = bg_level + threshold_ratio * (p99_level - bg_level)
+
+        # 후보 행 스캔 범위
         y_lo = max(0, int(base_y) - window)
         y_hi = min(h - 1, int(base_y) + window)
-        
-        # 각 행에서 valid_cols 픽셀들의 신호 유효 비율 계산
-        row_scores = []
-        for row in range(y_lo, y_hi + 1):
-            vals = img_data[row, valid_cols]
-            frac = np.mean(vals > signal_thresh)  # 신호가 있는 열 비율
-            row_scores.append((row, frac))
-        
-        row_scores = np.array(row_scores)  # shape (N, 2): [row, frac]
-        
-        # 신호 비율의 변화가 가장 급격한 경계 행 찾기
-        # 스무딩 후 gradient 최대 지점 = 데이터가 갑자기 나타나기 시작하는 경계
-        from scipy.ndimage import uniform_filter1d
-        smoothed = uniform_filter1d(row_scores[:, 1], size=5)
-        gradient = np.gradient(smoothed)
-        
-        # gradient > 0인 구간에서 최대 기울기 위치 (아래로 내려갈수록 신호 증가)
-        # 단, 경계는 "신호가 처음 충분히 넘는" 행 → frac >= 0.6 인 첫 번째 행 (위에서 아래로)
-        threshold_frac = 0.6
-        for idx in range(len(row_scores)):
-            if row_scores[idx, 1] >= threshold_frac:
-                best_row = int(row_scores[idx, 0])
-                return float(best_row)
-        
-        # fallback: 신호가 없으면 gradient 최대 지점 반환
-        peak_idx = np.argmax(gradient)
-        return float(row_scores[peak_idx, 0])
-    
+
+        rows  = np.arange(y_lo, y_hi + 1)
+        # 각 행의 valid_cols 신호 유효 비율 (vectorized)
+        patch = img_data[y_lo:y_hi+1, :][:, valid_cols]  # shape (N_rows, N_cols)
+        fracs = np.mean(patch > signal_thresh, axis=1)    # shape (N_rows,)
+
+        # 신호 취령률이 최대인 행 = 진짜 center_y
+        # (raw 이미지에서 center_y 행은 q_z=0 경계선으로, 가장 넘은 q_xy 커버리지를 가짐)
+        best_idx = int(np.argmax(fracs))
+        return float(rows[best_idx])
+
     except Exception:
         return float(base_y)
 
@@ -307,20 +284,19 @@ if uploaded_files:
         per_centers = []
         pbar2 = st.progress(0)
         
-        for i, row in edited_df.iterrows():
+        for enum_i, (i, row) in enumerate(edited_df.iterrows()):
             img_data = fabio.open(paths[row["파일명"]]).data
             # 데이터 경계 스캔으로 center_y 결정
-            # 첫 샘플은 ±80px, 나머지는 이전 샘플 기준 ±40px 탐색
-            search_window = 80 if i == 0 else 40
+            search_window = 80 if enum_i == 0 else 40
             cal_y = find_center_y_by_data_edge(
                 img_data, fixed_x, track_y,
-                dist_m=dist_m, px_m=px_m,
+                dist_m=dist_m, px_m=px_m, wavelength_m=wavelength,
                 window=search_window
             )
-            track_y = cal_y  # 다음 샘플의 초기값으로 전달
+            track_y = cal_y
             per_centers.append({'파일명': row['파일명'], '입사각': row['입사각(deg)'],
                                 'center_x': fixed_x, 'center_y': cal_y})
-            pbar2.progress((i + 1) / len(edited_df))
+            pbar2.progress((enum_i + 1) / len(edited_df))
         
         st.session_state.per_sample_centers = per_centers
         st.session_state.step2_done = True
@@ -381,7 +357,7 @@ if uploaded_files:
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             pbar = st.progress(0)
             
-            for i, row in edited_df.iterrows():
+            for enum_i, (_, row) in enumerate(edited_df.iterrows()):
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
@@ -542,7 +518,7 @@ if uploaded_files:
                         })
                             
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
-                pbar.progress((i + 1) / len(edited_df))
+                pbar.progress((enum_i + 1) / len(edited_df))
         
         # DataFrame에는 표시용 컬럼만, diagnostics는 별도 저장
         display_results = [{"파일명": r["파일명"], "입사각": r["입사각"], 
