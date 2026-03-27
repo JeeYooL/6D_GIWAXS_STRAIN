@@ -86,20 +86,19 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
 # [Step-2] 데이터 경계 기반 center_y 탐색
 def find_center_y_by_data_edge(img_data, base_x, base_y, dist_m, px_m, wavelength_m,
                                window=80, qxy_range=3.0, qxy_beamstop=0.2,
-                               threshold_ratio=0.10):
+                               threshold_frac=0.35):
     """
-    q_xy = [-qxy_range, -qxy_beamstop] ∪ [qxy_beamstop, qxy_range] 범위 픽셀 열들을
-    base_y ± window 행 범위에서 스캔하여, 신호 취령률이 최대인 행을 center_y로 반환.
-    raw 이미지에서 center_y 위쪽(작은 row index) = GIWAXS 데이터 요나.
-    center_y 자체 행 = 신호가 q_xy 전체에 걸쳐 가장 완전하게 나타나는 위치.
+    raw 이미지에서 center_y 탐색:
+    - center_y 위쪽 (row < center_y): GIWAXS 데이터 제다 (링 있음)
+    - center_y 아래쪽 (row > center_y): 기판/배경 (데이터 없음)
+    스캔 방향: y_hi(기판 쪽, 신호 없음) → y_lo(위, GIWAXS 쪽)
+    → 신호가 처음 나타나는 첫 번째 행 = center_y
     """
     try:
         h, w = img_data.shape
 
-        # 정확한 q_xy → 픽셀 열 변환
-        # q [[Å⁻¹]] = 2π * r_px * px_m / (λ * dist_m) ⇒ r_px = q * λ * dist_m / (2π * px_m)
-        # λ [m], dist_m [m], px_m [m]→ r_px 단위는 pixel
-        px_per_q = (wavelength_m * 1e10 * dist_m) / (2 * np.pi * px_m)  # [px per Å⁻¹]
+        # q_xy → 픽셀 열 변환 (q = 2π r px_m / (λ dist_m))
+        px_per_q = (wavelength_m * 1e10 * dist_m) / (2 * np.pi * px_m)
 
         q_left   = np.linspace(-qxy_range, -qxy_beamstop, 20)
         q_right  = np.linspace( qxy_beamstop,  qxy_range, 20)
@@ -107,28 +106,31 @@ def find_center_y_by_data_edge(img_data, base_x, base_y, dist_m, px_m, wavelengt
 
         col_indices = np.round(base_x + q_samples * px_per_q).astype(int)
         valid_cols  = col_indices[(col_indices >= 0) & (col_indices < w)]
-
         if len(valid_cols) == 0:
             return float(base_y)
 
-        # 신호 임계값
-        bg_level      = np.percentile(img_data, 20)
-        p99_level     = np.percentile(img_data, 99)
-        signal_thresh = bg_level + threshold_ratio * (p99_level - bg_level)
+        # 신호 임계값: 전체 이미지의 중간 포인트 사용
+        bg_level      = np.percentile(img_data, 30)
+        p95_level     = np.percentile(img_data, 95)
+        signal_thresh = bg_level + 0.15 * (p95_level - bg_level)
 
-        # 후보 행 스캔 범위
+        # 후보 행 범위 (base_y ± window)
         y_lo = max(0, int(base_y) - window)
         y_hi = min(h - 1, int(base_y) + window)
 
-        rows  = np.arange(y_lo, y_hi + 1)
-        # 각 행의 valid_cols 신호 유효 비율 (vectorized)
-        patch = img_data[y_lo:y_hi+1, :][:, valid_cols]  # shape (N_rows, N_cols)
-        fracs = np.mean(patch > signal_thresh, axis=1)    # shape (N_rows,)
+        patch = img_data[y_lo:y_hi+1, :][:, valid_cols]
+        fracs = np.mean(patch > signal_thresh, axis=1)  # shape: (N_rows,)
 
-        # 신호 취령률이 최대인 행 = 진짜 center_y
-        # (raw 이미지에서 center_y 행은 q_z=0 경계선으로, 가장 넘은 q_xy 커버리지를 가짐)
-        best_idx = int(np.argmax(fracs))
-        return float(rows[best_idx])
+        # 핵심: y_hi → y_lo 방향으로 (기판 쪽에서 위쪽으로) 스캔,
+        # 신호 취령률이 threshold_frac 이상인 첫 번째 행 = center_y
+        # (= GIWAXS 데이터가 시작되는 경계선)
+        rows = np.arange(y_lo, y_hi + 1)
+        for idx in range(len(fracs) - 1, -1, -1):   # y_hi에서 y_lo 순서
+            if fracs[idx] >= threshold_frac:
+                return float(rows[idx])
+
+        # fallback: 신호가 없으면 base_y 반환
+        return float(base_y)
 
     except Exception:
         return float(base_y)
@@ -327,7 +329,11 @@ if uploaded_files:
                 data_half = img_data[:int(cy), :]
                 log_half = np.log1p(np.clip(data_half, 0, None))
                 if mask_bg:
-                    log_half = np.where(log_half <= 5.0, np.nan, log_half)
+                    masked = np.where(log_half <= 5.0, np.nan, log_half)
+                    # center_y 근처 하단 100 행(q_z≈0 경계)은 마스크 제외
+                    preserve_rows = max(0, log_half.shape[0] - 100)
+                    masked[preserve_rows:, :] = log_half[preserve_rows:, :]
+                    log_half = masked
                 h_half = log_half.shape[0]
                 ext = [-cx*dq, (w-cx)*dq, 0, h_half*dq]
                 
