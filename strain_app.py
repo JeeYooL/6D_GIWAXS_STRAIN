@@ -23,7 +23,7 @@ def extract_incidence_angle(filename):
     return float(match.group(1)) if match else 0.10
 
 # [NEW] 회절 링(Ring) 기반 Azimuthal Variance Minimization 원점 탐색
-def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
+def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100, fix_x=False):
     """
     회절 링의 azimuthal intensity variance를 최소화하는 (cx, cy)를 탐색.
     정확한 중심에서는 링 위의 밝기가 균일(variance↓), 빗나가면 불균일(variance↑).
@@ -76,16 +76,31 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100):
                         n_valid += 1
             return total_var / max(n_valid, 1)
         
-        # Nelder-Mead 최적화 (초기값 ±30px 범위 내에서 탐색)
-        x0 = [base_x, base_y]
-        result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
-                          options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
-        
-        opt_x, opt_y = result.x
-        
-        # 결과가 초기값에서 너무 벗어나면 (>30px) 초기값을 유지 (안전장치)
-        if abs(opt_x - base_x) > 30 or abs(opt_y - base_y) > 30:
-            return float(base_x), float(base_y)
+        if fix_x and base_x is not None:
+            # X 위치를 고정하고 Y에 대해서만 1D 최적화 수행
+            def azimuthal_cost_y(y):
+                return azimuthal_cost([base_x, y[0]])
+            
+            y0 = [base_y]
+            result = minimize(azimuthal_cost_y, y0, method='Nelder-Mead',
+                              options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
+            
+            opt_x = base_x
+            opt_y = result.x[0]
+            
+            if abs(opt_y - base_y) > window:
+                opt_y = base_y
+        else:
+            # Nelder-Mead 최적화 (초기값 ±window px 범위 내에서 탐색)
+            x0 = [base_x, base_y]
+            result = minimize(azimuthal_cost, x0, method='Nelder-Mead',
+                              options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 200})
+            
+            opt_x, opt_y = result.x
+            
+            # 결과가 초기값에서 너무 벗어나면 초기값을 유지 (안전장치)
+            if abs(opt_x - base_x) > window or abs(opt_y - base_y) > window:
+                return float(base_x), float(base_y)
         
         return float(opt_x), float(opt_y)
         
@@ -234,15 +249,23 @@ if uploaded_files:
             pbar = st.progress(0)
             
             # [동적 빔 센터 흐름 추적]
-            # 첫 샘플은 사용자가 설정한 dbx, dby를 기준으로, 다음 샘플부터는 이전 샘플의 중심을 기준으로 ±20 픽셀씩만 한정 추적
+            # 1. 첫 샘플은 X, Y 모두 미세조정하여 센터를 찾음
+            # 2. 다음 샘플부터는 첫 샘플의 X (q_xy)는 고정하고, Y (q_z) 위치만 이전 샘플을 기준으로 ±20 픽셀씩 한정 추적
             track_x, track_y = dbx, dby
+            fixed_x = dbx
             
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
-                    # 현재 샘플의 물리적 원점(Beam Center) 미세조정 탐색 및 업데이트
-                    track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=20)
+                    if i == 0:
+                        # 첫번째 샘플 (저각): X, Y 모두 미세조정
+                        track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=30, fix_x=False)
+                        fixed_x = track_x  # 첫 샘플의 X 고정
+                    else:
+                        # 나머지 샘플 (고각 등): X는 첫 샘플의 것으로 고정, Y만 이전 샘플 기준 미세조정
+                        _, track_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
+                        track_x = fixed_x
                     
                     # 입사각 보정: pyFAI rot1 파라미터로 GIWAXS 입사각 반영
                     incidence_rad = np.radians(row["입사각(deg)"])
