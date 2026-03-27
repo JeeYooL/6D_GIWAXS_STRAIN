@@ -109,11 +109,14 @@ def auto_calibrate_center(img_data, base_x=None, base_y=None, window=100, fix_x=
         return float(img_data.shape[1]/2.0), float(img_data.shape[0]/2.0)
 
 st.set_page_config(page_title="UNIST 6D GIWAXS Analyzer", layout="wide")
-st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
+st.title("🔬 6D GIWAXS Strain 분석 (2단계 빔 센터 보정)")
 
-# --- 세션 상태 초기화 (자동 정렬 값 유지) ---
+# --- 세션 상태 초기화 ---
 if 'dbx' not in st.session_state: st.session_state.dbx = 1435.83
 if 'dby' not in st.session_state: st.session_state.dby = 1439.11
+if 'per_sample_centers' not in st.session_state: st.session_state.per_sample_centers = None
+if 'step1_done' not in st.session_state: st.session_state.step1_done = False
+if 'step2_done' not in st.session_state: st.session_state.step2_done = False
 
 # --- 사이드바: 실험 셋업 ---
 st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
@@ -122,27 +125,11 @@ dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f")
 pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
 st.sidebar.divider()
-st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
+st.sidebar.subheader("🎯 빔 센터(Beam Center) 수동 설정")
 
 # 수동 조정 입력창 (세션 상태와 연동)
-dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
-dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
-
-# [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
-if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
-    if 'current_img' in st.session_state:
-        # 화면의 Number_input에 바로 입력된 최신값(dbx, dby) 주변 ±100px 영역으로 국한하여 탐색
-        dbx_a, dby_a = auto_calibrate_center(
-            st.session_state.current_img, 
-            base_x=dbx, 
-            base_y=dby, 
-            window=100
-        )
-        st.session_state.dbx = dbx_a
-        st.session_state.dby = dby_a
-        st.sidebar.success(f"미세조정 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
-    else:
-        st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
+dbx = st.sidebar.number_input("DBx (Center X)", value=st.session_state.dbx, step=0.01)
+dby = st.sidebar.number_input("DBy (Center Y)", value=st.session_state.dby, step=0.01)
 
 wavelength = (12.3984 / energy_kev) * 1e-10 
 dist_m = dist_mm / 1000.0
@@ -212,8 +199,10 @@ if uploaded_files:
     input_df = pd.DataFrame({"파일명": file_list, "입사각(deg)": angles})
     edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor_auto")
 
-    # --- [검증용] 실시간 2D 프리뷰 (센터 표시) ---
-    st.subheader("🖼️ 현재 빔 센터 정렬 확인 (Preview) - 가장 위의 이미지 기준")
+    # ========================================
+    # 1단계: 첫 번째 이미지 (저각) 빔 센터 미세조정
+    # ========================================
+    st.subheader("📌 1단계: 첫 번째 이미지 센터 미세조정")
     img_preview = st.session_state.current_img
     flipped_img = np.flipud(img_preview)
     
@@ -223,10 +212,8 @@ if uploaded_files:
         log_preview = np.where(log_preview <= 5.0, np.nan, log_preview)
         
     fig_pre, ax_pre = plt.subplots(figsize=(6, 4))
-    
     cmap_pre = plt.cm.jet.copy()
     cmap_pre.set_bad('white', 1.)
-    
     im_pre = ax_pre.imshow(log_preview, cmap=cmap_pre)
     
     # 십자선 표시 (Flip 고려)
@@ -240,32 +227,144 @@ if uploaded_files:
     plt.colorbar(im_pre, ax=ax_pre)
     st.pyplot(fig_pre)
     plt.close(fig_pre)
-    st.info("💡 위 이미지의 **빨간 십자선(+)**이 파란색 빔스탑의 정중앙에 위치하는지 확인하시고 아래 버튼을 누르세요.")
-
-    if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
+    
+    st.info("💡 위 이미지의 **빨간 십자선(+)**이 빔스탑 정중앙에 위치하는지 확인하세요.")
+    
+    if st.button("🪄 1단계: 첫 이미지 센터 자동 미세조정 (X+Y, ±100px)", key="step1_btn"):
+        dbx_a, dby_a = auto_calibrate_center(
+            st.session_state.current_img, 
+            base_x=dbx, base_y=dby, window=100, fix_x=False
+        )
+        st.session_state.dbx = dbx_a
+        st.session_state.dby = dby_a
+        st.session_state.step1_done = True
+        st.session_state.per_sample_centers = None  # 2단계 초기화
+        st.session_state.step2_done = False
+        st.success(f"✅ 1단계 완료! 첫 이미지 센터: X={dbx_a:.2f}, Y={dby_a:.2f}")
+        st.rerun()
+    
+    if st.session_state.step1_done:
+        st.success(f"✅ 1단계 완료 — 기준 센터: X={st.session_state.dbx:.2f}, Y={st.session_state.dby:.2f}")
+    
+    # ========================================
+    # 2단계: 각 샘플별 q_z (Y) 원점 보정
+    # ========================================
+    st.divider()
+    st.subheader("📌 2단계: 각 샘플별 q_z 원점 보정")
+    st.caption("각이 증가할수록 반전된 이미지 기준으로 원점이 위로 올라가는 경향을 보정합니다. q_xy(X)는 첫 이미지 기준으로 고정하고 q_z(Y)만 각 샘플별로 미세조정합니다.")
+    
+    if st.button("🔍 2단계: 각 샘플별 q_z 보정 실행", key="step2_btn", type="secondary"):
+        fixed_x = st.session_state.dbx
+        track_y = st.session_state.dby
+        per_centers = []
+        pbar2 = st.progress(0)
+        
+        for i, row in edited_df.iterrows():
+            img_data = fabio.open(paths[row["파일명"]]).data
+            
+            if i == 0:
+                # 첫 샘플: 이미 1단계에서 보정된 값 사용 (Y만 재확인)
+                _, cal_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=30, fix_x=True)
+            else:
+                # 나머지: X 고정, Y만 이전 샘플 기준 ±20px 보정
+                _, cal_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
+            
+            track_y = cal_y  # 다음 샘플의 초기값으로 전달
+            per_centers.append({'파일명': row['파일명'], '입사각': row['입사각(deg)'], 
+                                'center_x': fixed_x, 'center_y': cal_y})
+            pbar2.progress((i + 1) / len(edited_df))
+        
+        st.session_state.per_sample_centers = per_centers
+        st.session_state.step2_done = True
+        st.rerun()
+    
+    # 2단계 결과 표시: 센터 테이블 + 각 샘플 2D/1D 프리뷰
+    if st.session_state.per_sample_centers is not None:
+        centers_df = pd.DataFrame(st.session_state.per_sample_centers)
+        st.success("✅ 2단계 완료 — 각 샘플별 보정된 빔 센터:")
+        st.dataframe(centers_df.style.format({'center_x': '{:.2f}', 'center_y': '{:.2f}', '입사각': '{:.2f}'}), use_container_width=True)
+        
+        # 각 샘플에 대한 2D GIWAXS + 1D 적분 프리뷰
+        st.divider()
+        st.subheader("🖼️ 2단계 보정 결과 프리뷰 (2D GIWAXS + 1D 적분)")
+        
+        for ci, cinfo in enumerate(st.session_state.per_sample_centers):
+            fname = cinfo['파일명']
+            cx, cy = cinfo['center_x'], cinfo['center_y']
+            angle_deg = cinfo['입사각']
+            
+            with st.expander(f"📊 {fname} (입사각 {angle_deg:.2f}°, Y={cy:.2f})", expanded=(ci < 2)):
+                img_data = fabio.open(paths[fname]).data
+                incidence_rad = np.radians(angle_deg)
+                
+                geo = AzimuthalIntegrator(dist=dist_m, poni1=cy*px_m, poni2=cx*px_m,
+                                          wavelength=wavelength, pixel1=px_m, pixel2=px_m,
+                                          rot1=incidence_rad)
+                
+                q_out, I_out = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
+                q_in, I_in = geo.integrate1d(img_data, 1000, unit="q_A^-1", azimuth_range=(azi_in_min, azi_in_max))
+                
+                col_2d, col_out, col_in = st.columns(3)
+                
+                with col_2d:
+                    h, w = img_data.shape
+                    dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
+                    data_half = img_data[:int(cy), :]
+                    log_half = np.log1p(np.clip(data_half, 0, None))
+                    if mask_bg:
+                        log_half = np.where(log_half <= 5.0, np.nan, log_half)
+                    h_half = log_half.shape[0]
+                    ext = [-cx*dq, (w-cx)*dq, 0, h_half*dq]
+                    
+                    fig2d, ax2d = plt.subplots()
+                    cmap2 = plt.cm.jet.copy(); cmap2.set_bad('white', 1.)
+                    ax2d.imshow(log_half, cmap=cmap2, extent=ext, aspect='auto')
+                    ax2d.set_title(f"2D GIWAXS (Y={cy:.1f})", fontsize=9)
+                    ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
+                    st.pyplot(fig2d); plt.close(fig2d)
+                
+                with col_out:
+                    fig_o, ax_o = plt.subplots()
+                    ax_o.plot(q_out, I_out, 'b-', linewidth=0.8)
+                    ax_o.set_title(f"Out-of-plane 1D", fontsize=9)
+                    ax_o.set_xlabel(r"$q_z (\AA^{-1})$"); ax_o.set_ylabel("Intensity")
+                    ax_o.axvline(x=target_q, color='r', linestyle='--', alpha=0.5, label=f'target={target_q}')
+                    ax_o.legend(fontsize=7)
+                    st.pyplot(fig_o); plt.close(fig_o)
+                
+                with col_in:
+                    fig_i, ax_i = plt.subplots()
+                    ax_i.plot(q_in, I_in, 'b-', linewidth=0.8)
+                    ax_i.set_title(f"In-plane 1D", fontsize=9)
+                    ax_i.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax_i.set_ylabel("Intensity")
+                    ax_i.axvline(x=target_q, color='r', linestyle='--', alpha=0.5, label=f'target={target_q}')
+                    ax_i.legend(fontsize=7)
+                    st.pyplot(fig_i); plt.close(fig_i)
+    
+    # ========================================
+    # 3단계: 전수 Strain 분석 (보정된 센터 사용)
+    # ========================================
+    st.divider()
+    st.subheader("🚀 3단계: Strain 전수 분석")
+    if not st.session_state.step2_done:
+        st.warning("⚠️ 먼저 2단계 (각 샘플별 q_z 보정)를 완료해주세요.")
+    
+    if st.button("🚀 보정된 센터로 전수 분석 시작", type="primary", disabled=(not st.session_state.step2_done)):
         results, zip_buffer = [], io.BytesIO()
         report_figures = []  # Word 보고서용 그래프 저장
+        
+        # 2단계에서 보정된 각 샘플별 센터를 딕셔너리로 변환
+        center_map = {c['파일명']: (c['center_x'], c['center_y']) for c in st.session_state.per_sample_centers}
+        
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             pbar = st.progress(0)
-            
-            # [동적 빔 센터 흐름 추적]
-            # 1. 첫 샘플은 X, Y 모두 미세조정하여 센터를 찾음
-            # 2. 다음 샘플부터는 첫 샘플의 X (q_xy)는 고정하고, Y (q_z) 위치만 이전 샘플을 기준으로 ±20 픽셀씩 한정 추적
-            track_x, track_y = dbx, dby
-            fixed_x = dbx
             
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
-                    if i == 0:
-                        # 첫번째 샘플 (저각): X, Y 모두 미세조정
-                        track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=30, fix_x=False)
-                        fixed_x = track_x  # 첫 샘플의 X 고정
-                    else:
-                        # 나머지 샘플 (고각 등): X는 첫 샘플의 것으로 고정, Y만 이전 샘플 기준 미세조정
-                        _, track_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
-                        track_x = fixed_x
+                    # 2단계에서 보정된 센터 사용
+                    track_x, track_y = center_map.get(row["파일명"], (st.session_state.dbx, st.session_state.dby))
                     
                     # 입사각 보정: pyFAI rot1 파라미터로 GIWAXS 입사각 반영
                     incidence_rad = np.radians(row["입사각(deg)"])
