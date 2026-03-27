@@ -114,49 +114,12 @@ st.title("🔬 6D GIWAXS Strain 분석 (2단계 자동 정렬 적용)")
 # --- 세션 상태 초기화 (자동 정렬 값 유지) ---
 if 'dbx' not in st.session_state: st.session_state.dbx = 1435.83
 if 'dby' not in st.session_state: st.session_state.dby = 1439.11
-if 'centers' not in st.session_state: st.session_state.centers = {}
-if 'step2_done' not in st.session_state: st.session_state.step2_done = False
 
 # --- 사이드바: 실험 셋업 ---
-st.sidebar.divider()
-st.sidebar.subheader("📂 데이터 업로드 방식")
-use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
-
-uploaded_files = []
-if use_sample_data:
-    sample_dir = "sample_data"
-    if os.path.exists(sample_dir):
-        for fname in os.listdir(sample_dir):
-            if fname.lower().endswith(('.tif', '.tiff')):
-                fpath = os.path.join(sample_dir, fname)
-                with open(fpath, "rb") as f:
-                    file_obj = io.BytesIO(f.read())
-                    file_obj.name = fname
-                    uploaded_files.append(file_obj)
-    if not uploaded_files:
-        st.sidebar.warning(f"❌ `{sample_dir}` 폴더가 비어 있거나 TIF 파일이 없습니다. 파일을 넣어주세요!")
-else:
-    uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
-
-paths = {}
-file_list = []
-if uploaded_files:
-    file_list = sorted([f.name for f in uploaded_files])
-    
-    # [수정] fabio.open() 에러 방지를 위해 우선 모든 파일을 물리적 저장소에 기록
-    temp_dir = "temp_giwaxs"
-    os.makedirs(temp_dir, exist_ok=True)
-    paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
-    for uf in uploaded_files:
-        with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
-    
-    # 물리적으로 저장된 첫 번째 이미지를 읽어서 캐싱
-    if 'current_img' not in st.session_state or st.session_state.first_file != file_list[0]:
-        st.session_state.current_img = fabio.open(paths[file_list[0]]).data
-        st.session_state.first_file = file_list[0]
-
-    if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
-    if 'zip_data' not in st.session_state: st.session_state.zip_data = None
+st.sidebar.header("1. 실험 셋업 (6D UNIST-PAL)")
+energy_kev = st.sidebar.number_input("Energy (keV)", value=11.564, format="%.3f")
+dist_mm = st.sidebar.number_input("SDD (mm)", value=200.0, format="%.3f")
+pixel_um = st.sidebar.number_input("Pixel size (um)", value=78.13)
 
 st.sidebar.divider()
 st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
@@ -165,49 +128,19 @@ st.sidebar.subheader("🎯 빔 센터(Beam Center) 정렬")
 dbx = st.sidebar.number_input("DBx (Center X - 1)", value=st.session_state.dbx, step=0.01)
 dby = st.sidebar.number_input("DBy (Center Y - 1)", value=st.session_state.dby, step=0.01)
 
-# [Button 1] 첫 번째 이미지(저각) 센터 미세조정
-if st.sidebar.button("🎯 단계 1: 첫 이미지 센터 찾기 (X, Y 모두)", use_container_width=True):
+# [기능 개선] 동적 자동 정렬 버튼 (사용자가 수동으로 입력해둔 부근에서 빔 센터 미세조정)
+if st.sidebar.button("🪄 빔 센터 미세조정 (±100px 자동 탐색)"):
     if 'current_img' in st.session_state:
+        # 화면의 Number_input에 바로 입력된 최신값(dbx, dby) 주변 ±100px 영역으로 국한하여 탐색
         dbx_a, dby_a = auto_calibrate_center(
             st.session_state.current_img, 
             base_x=dbx, 
             base_y=dby, 
-            window=100,
-            fix_x=False
+            window=100
         )
         st.session_state.dbx = dbx_a
         st.session_state.dby = dby_a
-        st.sidebar.success(f"단계 1 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
-        # 단계 1이 수행되면 이전의 단계 2 결과는 무효화
-        st.session_state.centers = {}
-        st.session_state.step2_done = False
-    else:
-        st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
-
-# [Button 2] 모든 샘플에 대한 센터 미세조정 (X고정, Y추적)
-if st.sidebar.button("🧪 단계 2: 모든 샘플 원점 미세조정 (q_z 이동 보정)", type="primary", use_container_width=True):
-    if uploaded_files:
-        st.session_state.centers = {}
-        track_x, track_y = dbx, dby
-        fixed_x = dbx
-        
-        pbar_side = st.sidebar.progress(0)
-        for i, (fname, fpath) in enumerate(paths.items()):
-            img_data = fabio.open(fpath).data
-            if i == 0:
-                # 첫 샘플은 단계 1의 결과(dbx, dby)를 그대로 쓰거나 다시 한번 정밀 확인
-                track_x, track_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=30, fix_x=False)
-                fixed_x = track_x
-            else:
-                # 나머지 샘플은 X 고정, Y만 이전 샘플 주변에서 추적
-                _, track_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
-                track_x = fixed_x
-            
-            st.session_state.centers[fname] = (track_x, track_y)
-            pbar_side.progress((i + 1) / len(paths))
-        
-        st.session_state.step2_done = True
-        st.sidebar.success(f"✅ 모든 {len(paths)}개 샘플 보정 완료!")
+        st.sidebar.success(f"미세조정 완료! (X:{dbx_a:.2f}, Y:{dby_a:.2f})")
     else:
         st.sidebar.warning("⚠️ 먼저 TIF 파일을 업로드해주세요.")
 
@@ -237,7 +170,44 @@ c_in1, c_in2 = st.sidebar.columns(2)
 azi_in_min = c_in1.number_input("In 최소(°)", value=-15)
 azi_in_max = c_in2.number_input("In 최대(°)", value=-5)
 
+# --- 파일 업로드 방식 결정 ---
+st.sidebar.subheader("📂 데이터 업로드 방식")
+use_sample_data = st.sidebar.checkbox("✅ 서버의 샘플 데이터로 테스트하기", help="미리 올려둔 'sample_data' 폴더의 파일 사용")
+
+uploaded_files = []
+if use_sample_data:
+    sample_dir = "sample_data"
+    if os.path.exists(sample_dir):
+        for fname in os.listdir(sample_dir):
+            if fname.lower().endswith(('.tif', '.tiff')):
+                fpath = os.path.join(sample_dir, fname)
+                with open(fpath, "rb") as f:
+                    file_obj = io.BytesIO(f.read())
+                    file_obj.name = fname
+                    uploaded_files.append(file_obj)
+    if not uploaded_files:
+        st.sidebar.warning(f"❌ `{sample_dir}` 폴더가 비어 있거나 TIF 파일이 없습니다. 파일을 넣어주세요!")
+else:
+    uploaded_files = st.sidebar.file_uploader("📂 TIF 파일 업로드", type=['tif', 'tiff'], accept_multiple_files=True)
+
 if uploaded_files:
+    file_list = sorted([f.name for f in uploaded_files])
+    
+    # [수정] fabio.open() 에러 방지를 위해 우선 모든 파일을 물리적 저장소에 기록
+    temp_dir = "temp_giwaxs"
+    os.makedirs(temp_dir, exist_ok=True)
+    paths = {uf.name: os.path.join(temp_dir, uf.name) for uf in uploaded_files}
+    for uf in uploaded_files:
+        with open(paths[uf.name], "wb") as f: f.write(uf.getbuffer())
+    
+    # 물리적으로 저장된 첫 번째 이미지를 읽어서 캐싱
+    if 'current_img' not in st.session_state or st.session_state.first_file != file_list[0]:
+        st.session_state.current_img = fabio.open(paths[file_list[0]]).data
+        st.session_state.first_file = file_list[0]
+
+    if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
+    if 'zip_data' not in st.session_state: st.session_state.zip_data = None
+
     angles = [extract_incidence_angle(f) for f in file_list]
     input_df = pd.DataFrame({"파일명": file_list, "입사각(deg)": angles})
     edited_df = st.data_editor(input_df, use_container_width=True, key="data_editor_auto")
@@ -272,62 +242,32 @@ if uploaded_files:
     plt.close(fig_pre)
     st.info("💡 위 이미지의 **빨간 십자선(+)**이 파란색 빔스탑의 정중앙에 위치하는지 확인하시고 아래 버튼을 누르세요.")
 
-    # --- [NEW] 단계 2 결과 확인 (1D 그래프 프리뷰) ---
-    if st.session_state.step2_done:
-        st.divider()
-        st.subheader("🔍 단계 2: 샘플별 원점 보정 결과 확인 (1D Preview)")
-        
-        preview_col_n = 3
-        cols = st.columns(preview_col_n)
-        
-        for i, row in edited_df.iterrows():
-            fname = row["파일명"]
-            if fname in st.session_state.centers:
-                cx, cy = st.session_state.centers[fname]
-                img_data = fabio.open(paths[fname]).data
-                
-                # 가벼운 1D 적분으로 확인
-                geo = AzimuthalIntegrator(dist=dist_m, poni1=cy*px_m, poni2=cx*px_m, 
-                                          wavelength=wavelength, pixel1=px_m, pixel2=px_m,
-                                          rot1=np.radians(row["입사각(deg)"]))
-                
-                q_out, I_out = geo.integrate1d(img_data, 300, unit="q_A^-1", azimuth_range=(azi_out_min, azi_out_max))
-                
-                with cols[i % preview_col_n]:
-                    fig_check, ax_check = plt.subplots(figsize=(4, 3))
-                    ax_check.plot(q_out, I_out, label=f"{row['입사각(deg)']}°", color='green')
-                    ax_check.axvline(x=target_q, color='red', linestyle='--', alpha=0.5)
-                    ax_check.set_title(f"Y-shift: {cy-dby:.1f}px", fontsize=8)
-                    ax_check.set_xlabel("q")
-                    ax_check.legend(fontsize=7)
-                    st.pyplot(fig_check)
-                    plt.close(fig_check)
-        st.success("각 샘플의 원점이 보정되었습니다. 이제 아래 '전수 분석'을 시작하세요.")
-
     if st.button("🚀 위 설정으로 전수 분석 시작", type="primary"):
         results, zip_buffer = [], io.BytesIO()
         report_figures = []  # Word 보고서용 그래프 저장
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             pbar = st.progress(0)
             
+            # [동적 빔 센터 흐름 추적]
+            # 1. 첫 샘플은 X, Y 모두 미세조정하여 센터를 찾음
+            # 2. 다음 샘플부터는 첫 샘플의 X (q_xy)는 고정하고, Y (q_z) 위치만 이전 샘플을 기준으로 ±20 픽셀씩 한정 추적
+            track_x, track_y = dbx, dby
+            fixed_x = dbx
+            
             for i, row in edited_df.iterrows():
                 try:
                     img_data = fabio.open(paths[row["파일명"]]).data
                     
-                    # 1. 보정된 원점 정보 가져오기 (단계 2 결과가 있으면 사용, 없으면 단계 1/수동값 기반 실시간 추적)
-                    if row["파일명"] in st.session_state.centers:
-                        track_x, track_y = st.session_state.centers[row["파일명"]]
+                    if i == 0:
+                        # 첫번째 샘플 (저각): X, Y 모두 미세조정
+                        track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=30, fix_x=False)
+                        fixed_x = track_x  # 첫 샘플의 X 고정
                     else:
-                        # 폴백: 이전 로직 유지
-                        if i == 0:
-                            track_x, track_y = dbx, dby
-                            track_x, track_y = auto_calibrate_center(img_data, base_x=track_x, base_y=track_y, window=30, fix_x=False)
-                            first_x = track_x
-                        else:
-                            _, track_y = auto_calibrate_center(img_data, base_x=first_x, base_y=track_y, window=20, fix_x=True)
-                            track_x = first_x
+                        # 나머지 샘플 (고각 등): X는 첫 샘플의 것으로 고정, Y만 이전 샘플 기준 미세조정
+                        _, track_y = auto_calibrate_center(img_data, base_x=fixed_x, base_y=track_y, window=20, fix_x=True)
+                        track_x = fixed_x
                     
-                    # 2. 분석 수행
+                    # 입사각 보정: pyFAI rot1 파라미터로 GIWAXS 입사각 반영
                     incidence_rad = np.radians(row["입사각(deg)"])
                     
                     # 각 이미지만의 고유하게 틀어진 빔 센터를 바탕으로 pyFAI 물리적 엔진 초기화
@@ -395,8 +335,9 @@ if uploaded_files:
                             best_center = min(centers, key=lambda c: abs(c - target_q))
                             best_idx = 0
                         
-                        # 5. Strain 계산 (ε = q₀/q - 1)
+                        # 5. Strain 계산 (d-spacing 기반 정확 공식: ε = q₀/q - 1)
                         strain = (q_bulk / best_center - 1) * 100
+                        
                         sigma_fit = out.params[f'p{best_idx}_sigma'].value
                         fwhm_fit = sigma_fit * 2.355
                         ss_res = np.sum((Ic - out.best_fit) ** 2)
@@ -411,6 +352,7 @@ if uploaded_files:
                                 'fwhm_q': out.params[f'p{j}_sigma'].value * 2.355
                             } for j in range(len(peaks))]
                         }
+                        
                         return qc, Ic, out, strain, diagnostics
 
                     # 두 방향 각각 피팅
@@ -431,20 +373,29 @@ if uploaded_files:
                     with st.expander(f"📊 {row['파일명']} 상세 분석"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
+                            # 2D GIWAXS 패턴 — 실제 데이터(하반원)를 상반원으로 표시
                             h, w = img_data.shape
                             dq = (2*np.pi/(wavelength*1e10)) * (px_m/dist_m)
+                            
+                            # 실제 회절 데이터가 있는 반쪽 추출 (raw 상단 = 화면 하반원)
                             data_half = img_data[:int(track_y), :]
                             log_half = np.log1p(np.clip(data_half, 0, None))
                             if mask_bg:
                                 log_half = np.where(log_half <= 5.0, np.nan, log_half)
+                            
                             h_half = log_half.shape[0]
                             ext = [-track_x*dq, (w-track_x)*dq, 0, h_half*dq]
-                            fig2d, ax2d = plt.subplots(); cmap_final = plt.cm.jet.copy(); cmap_final.set_bad('white', 1.)
+                            
+                            fig2d, ax2d = plt.subplots()
+                            cmap_final = plt.cm.jet.copy()
+                            cmap_final.set_bad('white', 1.)
+                            
                             ax2d.imshow(log_half, cmap=cmap_final, extent=ext, aspect='auto')
                             ax2d.set_title("2D GIWAXS"); ax2d.set_xlabel(r"$q_{xy} (\AA^{-1})$"); ax2d.set_ylabel(r"$q_z (\AA^{-1})$")
                             buf_2d = io.BytesIO(); fig2d.savefig(buf_2d, format='png', dpi=150, bbox_inches='tight'); buf_2d.seek(0)
                             st.pyplot(fig2d); plt.close(fig2d)
                         with c2:
+                            # 1D 피팅 결과 (Out-of-plane) + 진단 정보
                             fig_out, ax_out = plt.subplots()
                             ax_out.plot(qc_out, Ic_out, 'bo', markersize=3, label='Data')
                             ax_out.plot(qc_out, fit_out.best_fit, 'r-', label='Fit')
@@ -453,6 +404,7 @@ if uploaded_files:
                             buf_out = io.BytesIO(); fig_out.savefig(buf_out, format='png', dpi=150, bbox_inches='tight'); buf_out.seek(0)
                             st.pyplot(fig_out); plt.close(fig_out)
                         with c3:
+                            # 1D 피팅 결과 (In-plane) + 진단 정보
                             fig_in, ax_in = plt.subplots()
                             ax_in.plot(qc_in, Ic_in, 'bo', markersize=3, label='Data')
                             ax_in.plot(qc_in, fit_in.best_fit, 'r-', label='Fit')
@@ -461,19 +413,22 @@ if uploaded_files:
                             buf_in = io.BytesIO(); fig_in.savefig(buf_in, format='png', dpi=150, bbox_inches='tight'); buf_in.seek(0)
                             st.pyplot(fig_in); plt.close(fig_in)
                         
+                        # Word 보고서용 그래프 저장
                         report_figures.append({
                             'name': row['파일명'], 'angle': row['입사각(deg)'],
                             'strain_out': strain_out, 'strain_in': strain_in,
                             'fig_2d': buf_2d, 'fig_out': buf_out, 'fig_in': buf_in
                         })
+                            
                 except Exception as e: st.error(f"❌ {row['파일명']} 실패: {e}")
                 pbar.progress((i + 1) / len(edited_df))
         
+        # DataFrame에는 표시용 컬럼만, diagnostics는 별도 저장
         display_results = [{"파일명": r["파일명"], "입사각": r["입사각"], 
                             "Strain_Out(%)": r["Strain_Out(%)"], "Strain_In(%)": r["Strain_In(%)"]} 
                            for r in results]
         st.session_state.analysis_results = pd.DataFrame(display_results)
-        st.session_state.wh_results = results
+        st.session_state.wh_results = results  # diagnostics 포함 원본
         st.session_state.zip_data = zip_buffer.getvalue()
         st.session_state.report_figures = report_figures
 
@@ -481,7 +436,7 @@ if uploaded_files:
         st.divider(); st.subheader("📈 입사각별 Strain 트렌드")
         res_df = st.session_state.analysis_results
         if res_df.empty:
-            st.warning("⚠️ 성공적으로 분석된 데이터가 없습니다.")
+            st.warning("⚠️ 성공적으로 분석된 데이터가 없습니다. 피크가 잡히지 않았거나 데이터가 부족합니다. 적분 각도(Azimuth)와 Fit(q) 영역을 다시 조절해 보세요.")
         else:
             c1, c2 = st.columns([1, 1.5])
             with c1:
@@ -493,35 +448,77 @@ if uploaded_files:
                 ax_tr.plot(res_df["입사각"], res_df["Strain_In(%)"], 'ro-', label="In-plane")
                 ax_tr.set_xlabel("Incidence Angle (deg)")
                 ax_tr.set_ylabel("Strain (%)")
-                ax_tr.legend(); ax_tr.grid(True, linestyle='--', alpha=0.7)
+                ax_tr.legend()
+                ax_tr.grid(True, linestyle='--', alpha=0.7)
                 st.pyplot(fig_tr)
                 buf_trend = io.BytesIO(); fig_tr.savefig(buf_trend, format='png', dpi=150, bbox_inches='tight'); buf_trend.seek(0)
                 plt.close(fig_tr)
             
-            st.divider(); st.subheader("📝 Word 보고서 다운로드")
+            # --- Word 보고서 생성 및 다운로드 ---
+            st.divider()
+            st.subheader("📝 Word 보고서 다운로드")
+            
             if st.button("📄 Word 보고서 생성", key="gen_docx"):
                 doc = Document()
                 doc.add_heading('GIWAXS Strain Analysis Report', level=0)
-                doc.add_paragraph(f'Bulk q-value: {q_bulk:.4f} Å⁻¹  |  Energy: {energy_kev} keV')
+                doc.add_paragraph(f'Bulk q-value: {q_bulk:.4f} Å⁻¹  |  Fit range: [{q_min:.2f}, {q_max:.2f}] Å⁻¹')
+                doc.add_paragraph(f'Energy: {energy_kev} keV  |  Distance: {dist_mm} mm  |  Pixel: {pixel_um} μm')
+                
+                # 1. 결과 테이블
                 doc.add_heading('1. Strain Results Table', level=1)
                 table = doc.add_table(rows=1, cols=4, style='Light Shading Accent 1')
                 hdr = table.rows[0].cells
-                hdr[0].text = '파일명'; hdr[1].text = '입사각(deg)'; hdr[2].text = 'Strain_Out(%)'; hdr[3].text = 'Strain_In(%)'
+                hdr[0].text = '파일명'; hdr[1].text = '입사각(deg)'
+                hdr[2].text = 'Strain_Out(%)'; hdr[3].text = 'Strain_In(%)'
                 for _, r in res_df.iterrows():
                     row_cells = table.add_row().cells
-                    row_cells[0].text = str(r['파일명']); row_cells[1].text = f"{r['입사각']:.2f}"
-                    row_cells[2].text = f"{r['Strain_Out(%)']:.3f}"; row_cells[3].text = f"{r['Strain_In(%)']:.3f}"
-                doc.add_heading('2. Strain Trend', level=1); doc.add_picture(buf_trend, width=Inches(5.5))
+                    row_cells[0].text = str(r['파일명'])
+                    row_cells[1].text = f"{r['입사각']:.2f}"
+                    row_cells[2].text = f"{r['Strain_Out(%)']:.3f}"
+                    row_cells[3].text = f"{r['Strain_In(%)']:.3f}"
+                
+                # 2. 트렌드 그래프
+                doc.add_heading('2. Strain Trend', level=1)
+                doc.add_picture(buf_trend, width=Inches(5.5))
+                last_paragraph = doc.paragraphs[-1]
+                last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                
+                # 3. 각 샘플별 상세 분석 (2D + Out + In)
                 doc.add_heading('3. Per-Sample Analysis', level=1)
-                for item in st.session_state.get('report_figures', []):
+                figs = st.session_state.get('report_figures', [])
+                for item in figs:
                     doc.add_heading(f"{item['name']} (Angle: {item['angle']:.2f}°)", level=2)
+                    p_info = doc.add_paragraph()
+                    p_info.add_run(f"Out-of-plane Strain: {item['strain_out']:.3f}%  |  In-plane Strain: {item['strain_in']:.3f}%")
+                    
+                    # 2D 패턴
+                    item['fig_2d'].seek(0)
                     doc.add_picture(item['fig_2d'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    # Out-of-plane & In-plane (나란히 배치는 docx 한계로 순차 배치)
+                    item['fig_out'].seek(0)
                     doc.add_picture(item['fig_out'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    item['fig_in'].seek(0)
                     doc.add_picture(item['fig_in'], width=Inches(4.0))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
                     doc.add_page_break()
-                docx_buffer = io.BytesIO(); doc.save(docx_buffer); docx_buffer.seek(0)
+                
+                # 문서 저장
+                docx_buffer = io.BytesIO()
+                doc.save(docx_buffer)
+                docx_buffer.seek(0)
                 st.session_state.docx_data = docx_buffer.getvalue()
                 st.success("✅ Word 보고서가 생성되었습니다!")
+            
             if st.session_state.get('docx_data'):
-                st.download_button("💾 Word 보고서 다운로드 (.docx)", st.session_state.docx_data, "GIWAXS_Strain_Report.docx", 
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx")
+                st.download_button(
+                    "💾 Word 보고서 다운로드 (.docx)",
+                    st.session_state.docx_data,
+                    "GIWAXS_Strain_Report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_docx"
+                )
